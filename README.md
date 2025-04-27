@@ -85,8 +85,7 @@ The app will now subscribe to button events on your selected switches and contro
 ## Support and Issues
 
 Please report any issues or ask questions in the official Hubitat forum thread:
-
-[Link to your Hubitat Forum Thread]
+https://community.hubitat.com/t/hanks-switch-bot-zero-config-lighting-control-based-on-device-names-inovelli-hue/153029
 
 ## License
 
