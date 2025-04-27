@@ -19,16 +19,16 @@ You simply select all the switches, lights, and scenes you want the app to manag
 
 ## Device Naming Guide
 
-Switch Bot analyzes the display names of the devices you select to build its internal maps.
+Switch Bot analyzes the display names of the devices you select to build its internal maps. Devices must be named as follows:
 
 - **Name Stem:** The app looks for lights or scenes whose display name starts with the stem of the switch name before the word “Switch”.
 	- Example: `Living Room Overhead Switch` -> Controls `Living Room Overhead Lights`, `Living Room Overhead Fan`.
-- **Master/Room:** A switch named just the room name followed by "Switch" (e.g. `Kitchen Switch`) will control all other lights/scenes with matching stems that are *not* already controlled by a more specific switch in the same room. A switch with the word All after the room name (e.g. “Kitchen All Switch”) automatically controls all lights with the Kitchen stem.
+- **Master and All Switches:** A switch named just the room name followed by "Switch" (e.g. `Kitchen Switch`) will control all other lights/scenes with matching stems that are *not* already controlled by a more specific switch in the same room. A switch with the word All after the room name (e.g. `Kitchen All Switch`) automatically controls all lights with the Kitchen stem.
 - **Zone Tag:** Including a zone name in square brackets in the device's *name* or *label* field (e.g. `Hallway Switch [Living Zone]`) associates that switch (and lights/scenes with the same zone tag) with that zone. Zone tags are used across-room zone on/off actions (double tap up/down).
 
 ## Device Naming Example
 
-Here is an example of how you might setup a room with device names
+Here is an example of how you might setup a room with device names:
 
 - Kitchen Switch
 - Kitchen Island Switch
@@ -63,7 +63,7 @@ Scene Mode automatically exits after a period of inactivity (default 7 seconds, 
 1. Tap the Apps code section in your Hubitat Elevation web interface.
 2. Click **"+ Add App"**.
 3. Click the three-dot menu and then **"Import.”** 
-4. Paste the direct URL to the raw Groovy code for Hank's Switch Robot from this repository: [https://github.com/hankleukart/hanks-switch-bot/blob/main/hanks-switch-bot.groovy](https://github.com/hankleukart/hanks-switch-bot/blob/main/hanks-switch-bot.groovy)
+4. Paste the direct URL to the raw Groovy code for Hank's Switch Robot from this repository: https://raw.githubusercontent.com/hankleukart/hanks-switch-bot/main/hanks-switch-bot.groovy
 5. Click **"Import"**, then **"Save"**.
 
 ## Configuration
