@@ -6,7 +6,7 @@
 
 Hank's Switch Bot is a Hubitat Elevation app designed to dramatically simplify the process of controlling lights and scenes from multi-button switches. Forget creating dozens of rules or manually linking devices to buttons. This app automatically figures out the relationships between your switches, lights, and scenes based primarily on their device names and room properties.
 
-You simply select all the switches, lights, and scenes you want the app to manage, and Switch Robot builds the control logic for you. It’s designed to work perfectly with CoCoHue and Inovelli switches but can be used with other brands of switches and lights.
+You simply select all the switches, lights, and scenes you want the app to manage, and Switch Bot builds the control logic for you. It’s designed to work perfectly with CoCoHue and Inovelli switches but can be used with other brands of switches and lights.
 
 ## Features
 
