@@ -42,7 +42,7 @@ Here is an example of how you might setup a room with device names:
 
 ## Usage (Default Button Mappings)
 
-By default, Hank's Switch Robot uses these mappings pre-defined for Inovelli switches (configurable in Advanced settings):
+By default, Hank's Switch Bot uses these mappings pre-defined for Inovelli switches (configurable in Advanced settings):
 
 - **Tap Up:**
 	- **Normal Mode:** Lights on (to mode default level/CT). For scene-only switches (switches mapped to scenes but no lights), Tap Up defaults to cycling scenes forward outside scene mode.
@@ -63,7 +63,7 @@ Scene Mode automatically exits after a period of inactivity (default 7 seconds, 
 1. Tap the Apps code section in your Hubitat Elevation web interface.
 2. Click **"+ Add App"**.
 3. Click the three-dot menu and then **"Import.”** 
-4. Paste the direct URL to the raw Groovy code for Hank's Switch Robot from this repository: https://raw.githubusercontent.com/hankleukart/hanks-switch-bot/main/hanks-switch-bot.groovy
+4. Paste the direct URL to the raw Groovy code for Hank's Switch Bot from this repository: https://raw.githubusercontent.com/hankleukart/hanks-switch-bot/main/hanks-switch-bot.groovy
 5. Click **"Import"**, then **"Save"**.
 
 ## Configuration
@@ -72,8 +72,8 @@ Scene Mode automatically exits after a period of inactivity (default 7 seconds, 
 2. Click **"Add User App"**.
 3. Select **"Hank's Switch Bot"** from the list.
 4. In the app's main preferences:
-	- Select **all** the switches you want this app to manage under "Switches controlled by Switch Robot".
-	- Select **all** the lights and scenes you want this app to control under "Lights & Scenes controlled by Switch Robot". (Selecting all is recommended for comprehensive mapping).
+	- Select **all** the switches you want this app to manage under "Switches controlled by Switch Bot".
+	- Select **all** the lights and scenes you want this app to control under "Lights & Scenes controlled by Switch Bot". (Selecting all is recommended for comprehensive mapping).
 5. Scroll down and click **"Done"**.
 6. *Optional:* Review the "Switch Control Mappings Summary" section (appears after saving) to see how the app mapped your devices.
 7. *Optional:* Configure "Mode Lighting Defaults" to set preferred brightness/CT for different modes.
