@@ -200,12 +200,12 @@ preferences {
 }
 
 def installed() {
-	log.info "Installed Hank's Switch Machine"
+	log.info "Installed Hank's Switch Bot"
 	initialize()
 }
 
 def updated() {
-	log.info "Updated Hank's Switch Machine"
+	log.info "Updated Hank's Switch Bot"
 	unsubscribe()
 	initialize()
 }
