@@ -54,7 +54,7 @@ By default, Hank's Switch Bot uses these mappings pre-defined for Inovelli switc
 - **Tap Down 2x:** Zone/Room Lights OFF.
 - **Hold Up:** Dim up.
 - **Hold Down:** Dim down.
-- **Config Button:** Toggle Scene Mode On/Off for that switch.
+- **Config Button:** Toggle Scene Mode On/Off for that switch. On Inovelli switches, the LED bar will chase to indicate Scene Mode.
 
 Scene Mode automatically exits after a period of inactivity (default 7 seconds, configurable).
 
