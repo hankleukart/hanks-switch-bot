@@ -223,7 +223,7 @@ def initialize() {
 	state.switchZoneLights = [:]
 	state.switchScenes = [:]
 	state.firstAreaLightToSwitch = [:]
-	state.sortedSwitchSceneIds = [:]  
+	state.sortedSwitchSceneIds = [:]
 	state.switchDimmableAreaLightIds = [:]
 
 	state.deviceToIndexMap = [switches: [:], lightsAndScenes: [:]]
@@ -466,47 +466,62 @@ private void groupSiblingSwitches() {
 
 def buildDeviceMaps() {
 	log.info "Starting buildDeviceMaps..."
-	state.switchRoomLights = [:]
-	state.switchAreaLights = [:]
-	state.switchZoneLights = [:]
-	state.switchScenes = [:]
-	state.firstAreaLightToSwitch = [:]
-	state.sortedSwitchSceneIds = [:]
-	state.switchDimmableAreaLightIds = [:]
+	// Initialize state collections for storing mappings.
+	// These are maps where the key is the switch ID.
+	state.switchRoomLights = [:]           // Lights in the same room as the switch
+	state.switchAreaLights = [:]           // Specific lights controlled by the switch (stem-based or master)
+	state.switchZoneLights = [:]           // Lights in the same zone as the switch
+	state.switchScenes = [:]               // Scenes associated with the switch by stem or zone
+	state.firstAreaLightToSwitch = [:]     // Maps a primary light ID back to its controlling switch ID (for state syncing)
+	state.sortedSwitchSceneIds = [:]       // Sorted list of scene IDs for each switch
+	state.switchDimmableAreaLightIds = [:] // List of dimmable light IDs from switchAreaLights
 
+	// Pre-parse locations for all lights and scenes to avoid redundant parsing.
+	// Stores a map of [deviceIdString: locationMap], where locationMap is {roomName, areaName, zoneName, parsingName}
 	Map lightSceneLocations = [:]
 	settings.controlledLightsAndScenes?.each { dev ->
-		lightSceneLocations[dev.id.toString()] = parseDeviceLocation(dev)
+		if (dev?.id) { // Ensure device and ID are not null
+			lightSceneLocations[dev.id.toString()] = parseDeviceLocation(dev)
+		}
 	}
 
+	// Build a map of switch information (type, stem, location) for easier processing.
+	// Key: switchId (String), Value: Map {type, stem, loc, displayName}
 	Map switchInfoMap = [:]
 	settings.controlledSwitches?.each { sw ->
+		if (!sw?.id) return // Skip if switch or its ID is null
+
 		def switchId = sw.id.toString()
-		def switchLoc = state.switchIdToLocationMap[switchId]
+		def switchLoc = state.switchIdToLocationMap[switchId] // Location info parsed during initialize()
+
 		if (!switchLoc) {
-			log.warn "buildDeviceMaps: No location info for switch ID ${switchId} (${sw.displayName}). Skipping stem calculation for this switch."
+			log.warn "buildDeviceMaps: No location info for switch ID ${switchId} ('${sw.displayName}'). Skipping stem calculation for this switch."
+			// Ensure essential state maps have entries for this switch to prevent errors later
 			state.switchAreaLights[switchId] = []
 			state.switchScenes[switchId] = []
 			state.sortedSwitchSceneIds[switchId] = []
 			state.switchDimmableAreaLightIds[switchId] = []
-			return
+			return // Continue to next switch
 		}
 		
+		// Determine the base name of the switch for stem calculation (e.g., "Kitchen Ceiling" from "Kitchen Ceiling Switch")
 		String actualDisplayName = (sw.displayName?.trim() ?: "").replaceFirst(/((?i)\bSwitch\b).*/, '$1').trim()
 		String parsedRoom = switchLoc.roomName
 		String parsedArea = switchLoc.areaName
-		String type = "unknown"
-		String stem = null
-		String stemSourceDisplay = (sw)
+		String type = "unknown" // Switch type: regular, master, all
+		String stem = null      // The base name used for matching lights/scenes (e.g., "Kitchen Ceiling" or "Kitchen")
+		String stemSourceDisplay = sw.displayName ?: "" // Use full display name for stem source of regular switches
 
+		// Determine switch type and stem based on naming conventions
 		if (actualDisplayName.toLowerCase().endsWith(" all switch")) {
-			type = "all"
-			stem = parsedRoom
+			type = "all" // Example: "Kitchen All Switch"
+			stem = parsedRoom // Stem for "All" switches is the room name
 		} else if (actualDisplayName.toLowerCase().endsWith(" switch") && (parsedArea == null || parsedArea.isEmpty() || parsedArea.equalsIgnoreCase("all"))) {
-			type = "master"
-			stem = parsedRoom
+			type = "master" // Example: "Kitchen Switch" (implies master for the kitchen)
+			stem = parsedRoom // Stem for master switches is the room name
 		} else if (actualDisplayName.toLowerCase().endsWith(" switch")) {
-			type = "regular"
+			type = "regular" // Example: "Kitchen Ceiling Switch"
+			// Stem for regular switches is the name part before " Switch"
 			stem = stemSourceDisplay.substring(0, stemSourceDisplay.toLowerCase().lastIndexOf(" switch")).trim()
 		}
 		
@@ -514,6 +529,7 @@ def buildDeviceMaps() {
 			switchInfoMap[switchId] = [type: type, stem: stem, loc: switchLoc, displayName: actualDisplayName]
 		} else {
 			log.info "buildDeviceMaps: Switch '${actualDisplayName}' (ID: ${switchId}) did not generate a stem. It will rely on zone scenes if applicable."
+			// Initialize state for switches without stems
 			state.switchAreaLights[switchId] = []
 			state.switchScenes[switchId] = []
 			state.sortedSwitchSceneIds[switchId] = []
@@ -521,29 +537,28 @@ def buildDeviceMaps() {
 		}
 	}
 
+	// Assign Room Lights and Zone Lights (common for all switch types)
 	settings.controlledSwitches?.each { sw ->
+		if (!sw?.id) return
 		def switchId = sw.id.toString()
-		def sInfo = switchInfoMap[switchId]
 		def sLoc = state.switchIdToLocationMap[switchId]
 
-		if (!sLoc) return
+		if (!sLoc) return // Already logged if switchLoc was null during switchInfoMap creation
 
+		// Assign all non-scene devices in the same room to switchRoomLights
 		state.switchRoomLights[switchId] = settings.controlledLightsAndScenes?.findAll { light ->
-			if (isScene(light)) return false
+			if (isScene(light) || !light?.id) return false
 			def targetLoc = lightSceneLocations[light.id.toString()]
 			return targetLoc?.roomName && sLoc?.roomName && targetLoc.roomName.equalsIgnoreCase(sLoc.roomName)
 		}?.collect { it.id.toString() } ?: []
 
+		// Assign all non-scene devices in the same zone to switchZoneLights
 		if (sLoc?.zoneName) {
-			log.info "buildDeviceMaps: Switch '${sw.displayName}' (ID: ${switchId}) has zoneName: '${sLoc.zoneName}'. Looking for matching zone lights."
-			List<String> currentZoneLightIds = []
-			settings.controlledLightsAndScenes?.each { light ->
-				if (isScene(light)) return
+			List<String> currentZoneLightIds = settings.controlledLightsAndScenes?.findAll { light ->
+				if (isScene(light) || !light?.id) return false
 				def targetLoc = lightSceneLocations[light.id.toString()]
-				if (targetLoc?.zoneName && targetLoc.zoneName.equalsIgnoreCase(sLoc.zoneName)) {
-					currentZoneLightIds << light.id.toString()
-				}
-			}
+				return targetLoc?.zoneName && targetLoc.zoneName.equalsIgnoreCase(sLoc.zoneName)
+			}?.collect { it.id.toString() } ?: []
 			state.switchZoneLights[switchId] = currentZoneLightIds.unique()
 			if (currentZoneLightIds.isEmpty()) {
 				log.info "buildDeviceMaps: No lights found for zone '${sLoc.zoneName}' for switch '${sw.displayName}'."
@@ -553,25 +568,31 @@ def buildDeviceMaps() {
 		}
 	}
 
-	Set<String> allRegularlyMappedLightIds = new HashSet<>()
+	Set<String> allRegularlyMappedLightIds = new HashSet<>() // Keeps track of lights assigned to regular/all switches
 
+	// Initialize area light and dimmable light lists for all switches that have a stem (are in switchInfoMap)
 	switchInfoMap.each { switchId, sInfo ->
+		state.switchAreaLights[switchId] = []
 		state.switchDimmableAreaLightIds[switchId] = []
-
+	}
+	
+	// Pass 1: Process "regular" and "all" switches to populate their area lights and allRegularlyMappedLightIds
+	switchInfoMap.each { switchId, sInfo ->
 		if (sInfo.type == "regular" || sInfo.type == "all") {
 			String stem = sInfo.stem
 			List<String> currentAreaLightIds = []
 			settings.controlledLightsAndScenes?.each { targetDev ->
-				if (!isScene(targetDev)) {
-					String targetEffectiveName = (targetDev)
-					if (targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
+				if (!isScene(targetDev) && targetDev?.id) {
+					// Use the consistent parsingName from lightSceneLocations
+					String targetEffectiveName = lightSceneLocations[targetDev.id.toString()]?.parsingName
+					if (targetEffectiveName && stem && targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
 						currentAreaLightIds << targetDev.id.toString()
 					}
 				}
 			}
 			currentAreaLightIds = currentAreaLightIds.unique()
-			state.switchAreaLights[switchId] = currentAreaLightIds
-			allRegularlyMappedLightIds.addAll(currentAreaLightIds)
+			state.switchAreaLights[switchId] = currentAreaLightIds // Assign lights to this switch
+			allRegularlyMappedLightIds.addAll(currentAreaLightIds) // Add to the set of claimed lights
 
 			if (!currentAreaLightIds.isEmpty()) {
 				def areaLightObjects = getDevicesById(currentAreaLightIds, settings.controlledLightsAndScenes)
@@ -581,14 +602,20 @@ def buildDeviceMaps() {
 				
 				def sortedAreaLightObjects = areaLightObjects?.sort { it.displayName }
 				if (sortedAreaLightObjects && !sortedAreaLightObjects.isEmpty()) {
+					 // The first light of a regular/all switch is a candidate for state syncing
 					 state.firstAreaLightToSwitch[sortedAreaLightObjects.first().id.toString()] = switchId
 				}
 			}
-		} else if (sInfo.type == "master") {
-			String masterSwitchRoom = sInfo.stem
+		}
+	}
+
+	// Pass 2: Process "master" switches, assigning only lights not already in allRegularlyMappedLightIds
+	switchInfoMap.each { switchId, sInfo ->
+		if (sInfo.type == "master") {
+			String masterSwitchRoom = sInfo.stem // For master switches, stem is the roomName
 			List<String> masterLightIds = []
 			settings.controlledLightsAndScenes?.each { targetDev ->
-				if (!isScene(targetDev) && !allRegularlyMappedLightIds.contains(targetDev.id.toString())) {
+				if (!isScene(targetDev) && targetDev?.id && !allRegularlyMappedLightIds.contains(targetDev.id.toString())) { // CRITICAL CHECK
 					def targetLoc = lightSceneLocations[targetDev.id.toString()]
 					if (targetLoc?.roomName && targetLoc.roomName.equalsIgnoreCase(masterSwitchRoom)) {
 						masterLightIds << targetDev.id.toString()
@@ -596,7 +623,7 @@ def buildDeviceMaps() {
 				}
 			}
 			masterLightIds = masterLightIds.unique()
-			state.switchAreaLights[switchId] = masterLightIds
+			state.switchAreaLights[switchId] = masterLightIds // Assign remaining lights to this master switch
 			
 			if (!masterLightIds.isEmpty()) {
 				 def masterLightObjects = getDevicesById(masterLightIds, settings.controlledLightsAndScenes)
@@ -607,27 +634,31 @@ def buildDeviceMaps() {
 				 def sortedMasterLightObjects = masterLightObjects?.sort { it.displayName }
 				 if (sortedMasterLightObjects && !sortedMasterLightObjects.isEmpty()) {
 					def firstMasterLightId = sortedMasterLightObjects.first().id.toString()
+					// Master switch's first light is a candidate only if not already claimed by a regular/all switch
 					if (!state.firstAreaLightToSwitch.containsKey(firstMasterLightId)) {
 						state.firstAreaLightToSwitch[firstMasterLightId] = switchId
 					}
 				 }
-			} else {
-				 state.switchDimmableAreaLightIds[switchId] = []
 			}
+			// If masterLightIds is empty, switchDimmableAreaLightIds[switchId] remains [], which is correct.
 		}
 	}
-	
+
+	// Assign Scenes based on stems (applies to all switch types that generated a stem)
 	switchInfoMap.each { switchId, sInfo ->
 		String stem = sInfo.stem
 		List<String> currentSceneIds = []
 		settings.controlledLightsAndScenes?.each { targetDev ->
-			if (isScene(targetDev)) {
-				String targetEffectiveName = (targetDev)
-				if (stem && targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
+			if (isScene(targetDev) && targetDev?.id) {
+				// Use the consistent parsingName from lightSceneLocations
+				String targetEffectiveName = lightSceneLocations[targetDev.id.toString()]?.parsingName
+				if (stem && targetEffectiveName && targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
 					currentSceneIds << targetDev.id.toString()
 				}
 			}
 		}
+		// Ensure state.switchScenes and state.sortedSwitchSceneIds are initialized for this switchId
+		// even if they were initialized earlier for switches without stems.
 		state.switchScenes[switchId] = currentSceneIds.unique()
 
 		if (!currentSceneIds.isEmpty()) {
@@ -638,16 +669,20 @@ def buildDeviceMaps() {
 		}
 	}
 
+	// Fallback: Assign Zone-Specific Scenes for switches that have a zone AND no primary (stem-based) scenes.
 	log.info "Starting check for zone-specific scenes for switches without primary (stem-based) scenes..."
 	settings.controlledSwitches?.each { sw ->
+		if (!sw?.id) return
 		def switchId = sw.id.toString()
 		def switchLoc = state.switchIdToLocationMap[switchId]
 		def switchDisplayName = sw.displayName ?: "Switch ID ${switchId}"
 
+		// Ensure sortedSwitchSceneIds has an entry, even if empty, before checking its emptiness.
+		// This handles cases where a switch might not have been processed by switchInfoMap (e.g. no stem).
 		if (state.sortedSwitchSceneIds[switchId] == null) {
 			state.sortedSwitchSceneIds[switchId] = []
 		}
-		if (state.switchScenes[switchId] == null) {
+		if (state.switchScenes[switchId] == null) { // Also ensure switchScenes is initialized
 			 state.switchScenes[switchId] = []
 		}
 
@@ -656,12 +691,14 @@ def buildDeviceMaps() {
 		if (switchLoc?.zoneName && !hasPrimaryScenes) {
 			log.info "Switch '${switchDisplayName}' (ID: ${switchId}) has zone '${switchLoc.zoneName}' and no primary scenes. Checking for zone-specific scenes."
 			List<String> zoneSceneIds = []
-			String zoneNamePrefix = switchLoc.zoneName
+			String zoneNamePrefix = switchLoc.zoneName // Zone name itself is the prefix for scene names
 
 			settings.controlledLightsAndScenes?.each { targetDev ->
-				if (isScene(targetDev)) {
-					String targetEffectiveName = (targetDev)
-					if (targetEffectiveName.toLowerCase().startsWith(zoneNamePrefix.toLowerCase())) {
+				if (isScene(targetDev) && targetDev?.id) {
+					// Use the consistent parsingName from lightSceneLocations
+					String targetEffectiveName = lightSceneLocations[targetDev.id.toString()]?.parsingName
+					// Match if scene name starts with the zone name
+					if (targetEffectiveName && zoneNamePrefix && targetEffectiveName.toLowerCase().startsWith(zoneNamePrefix.toLowerCase())) {
 						zoneSceneIds << targetDev.id.toString()
 					}
 				}
@@ -669,9 +706,11 @@ def buildDeviceMaps() {
 
 			if (!zoneSceneIds.isEmpty()) {
 				List<String> uniqueZoneSceneIds = zoneSceneIds.unique()
-				state.switchScenes[switchId] = uniqueZoneSceneIds
-				
-				def zoneSceneDeviceObjects = getDevicesById(uniqueZoneSceneIds, settings.controlledLightsAndScenes)
+				// These zone scenes become the primary scenes for this switch
+				state.switchScenes[switchId].addAll(uniqueZoneSceneIds) // Add to existing, though it should be empty due to !hasPrimaryScenes
+				state.switchScenes[switchId] = state.switchScenes[switchId].unique() // Ensure uniqueness again
+
+				def zoneSceneDeviceObjects = getDevicesById(state.switchScenes[switchId], settings.controlledLightsAndScenes)
 				state.sortedSwitchSceneIds[switchId] = zoneSceneDeviceObjects?.sort { it.displayName }?.collect { it.id.toString() } ?: []
 				
 				log.info "Associated ${state.sortedSwitchSceneIds[switchId].size()} zone scenes with switch '${switchDisplayName}' (Zone: ${switchLoc.zoneName})."
@@ -734,7 +773,7 @@ def firstLightStateHandler(evt) {
 		if (eventName == "level") {
 			def newLevel = eventValue as Integer
 			if (targetSwitch.hasCommand("setLevel") && (targetSwitch.currentValue('level') as Integer) != newLevel) {
-				try { 
+				try {
 					targetSwitch.setLevel(newLevel)
 					log.info "Synced ${targetSwitch.displayName} to level ${newLevel}."
 				} catch (e) { log.error "Error setting level on switch ${targetSwitch.displayName}: ${e.message}" }
@@ -742,12 +781,12 @@ def firstLightStateHandler(evt) {
 		} else if (eventName == "switch") {
 			def newState = eventValue
 			if (newState == "on" && targetSwitch.hasCommand("on") && targetSwitch.currentValue('switch') != "on") {
-				 try { 
+				 try {
 					 targetSwitch.on()
 					 log.info "Synced ${targetSwitch.displayName} to ON."
 				} catch (e) { log.error "Error turning ON switch ${targetSwitch.displayName}: ${e.message}" }
 			} else if (newState == "off" && targetSwitch.hasCommand("off") && targetSwitch.currentValue('switch') != "off") {
-				 try { 
+				 try {
 					 targetSwitch.off()
 					 log.info "Synced ${targetSwitch.displayName} to OFF."
 				 } catch (e) { log.error "Error turning OFF switch ${targetSwitch.displayName}: ${e.message}" }
@@ -798,7 +837,7 @@ private void handleSceneModeAction(triggeringSwitch, buttonNumber, buttonEvent) 
 	}
 
 	def sceneCount = roomScenes.size()
-    def currentSceneIndex = (state.sceneIndex[switchId] != null) ? state.sceneIndex[switchId] : -1
+  def currentSceneIndex = (state.sceneIndex[switchId] != null) ? state.sceneIndex[switchId] : -1
 	def sceneActivated = false
 
 	if (buttonNumber == 1 && buttonEvent == "pushed") {
@@ -942,15 +981,15 @@ private void handleZoneOn(triggeringSwitch) {
 }
 
 private void handleAreaOff(triggeringSwitch, areaLights) {
-  if (areaLights && !areaLights.isEmpty()) {
+ if (areaLights && !areaLights.isEmpty()) {
 		log.info "handleAreaOff for ${triggeringSwitch.displayName}: Turning OFF ${areaLights.size()} area light(s)."
 		 areaLights.each { light ->
 			try { if (light.hasCommand("off")) light.off() }
 			catch (e) { log.error "Error turning light OFF for ${light.displayName}: ${e.message}"}
 		 }
-  } else {
+ } else {
 		log.warn "No area lights for ${triggeringSwitch.displayName}. Area Off skipped."
-  }
+ }
 }
 
 private void handleSceneOnlyCycle(triggeringSwitch) {
@@ -998,13 +1037,13 @@ private void handleDimStart(triggeringSwitch, dimmableAreaLights, String directi
 }
 
 private void handleDimStop(triggeringSwitch, dimmableAreaLights) {
-  if (dimmableAreaLights && !dimmableAreaLights.isEmpty()) {
+ if (dimmableAreaLights && !dimmableAreaLights.isEmpty()) {
 		log.info "handleDimStop for ${triggeringSwitch.displayName}: Stop level change for ${dimmableAreaLights.size()} dimmable light(s)."
 		dimmableAreaLights.each { light ->
 			try { if(light.hasCommand('stopLevelChange')) light.stopLevelChange() }
 			catch (e) { log.error "Error calling stopLevelChange() on ${light.displayName}: ${e.message}"}
 		}
-  } // else { log.debug "handleDimStop: No dimmable area lights for ${triggeringSwitch.displayName}. Skipping." } // Not a major event
+ } // else { log.debug "handleDimStop: No dimmable area lights for ${triggeringSwitch.displayName}. Skipping." } // Not a major event
 }
 
 private void handleZoneOff(triggeringSwitch) {
