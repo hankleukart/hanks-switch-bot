@@ -293,7 +293,7 @@ def initialize() {
 	log.info "Initialization complete."
 }
 
-private String getEffectiveDeviceNameForMatching(device) {
+private String getParsingName(device) {
 	if (!device) return ""
 	String originalDisplayName = device.displayName?.trim() ?: ""
 	String deviceRoomProp = null
@@ -318,10 +318,10 @@ def parseDeviceLocation(device) {
 	}
 
 	if (!device?.displayName) {
-		 return [roomName: null, areaName: null, zoneName: zoneName, effectiveNameUsedForParsing: ""]
+		 return [roomName: null, areaName: null, zoneName: zoneName, parsingName: ""]
 	}
 
-	String baseDisplayNameForParsing = getEffectiveDeviceNameForMatching(device)
+	String baseDisplayNameForParsing = getParsingName(device)
 	String deviceRoomProp = null
 	try { deviceRoomProp = device.roomName?.trim() } catch (MissingPropertyException e) { /*ignore*/ }
 
@@ -361,7 +361,7 @@ def parseDeviceLocation(device) {
 		}
 	}
 	// log.trace "parseDeviceLocation for '${device?.displayName}' (Name: '${device?.name}'): Room='${roomName}', Area='${areaName}', Zone='${zoneName}', EffectiveName='${baseDisplayNameForParsing}'"
-	return [roomName: roomName?.trim(), areaName: areaName?.trim(), zoneName: zoneName, effectiveNameUsedForParsing: baseDisplayNameForParsing]
+	return [roomName: roomName?.trim(), areaName: areaName?.trim(), zoneName: zoneName, parsingName: baseDisplayNameForParsing]
 }
 
 private void normalizeSwitchRoomNames() {
@@ -384,7 +384,7 @@ private void normalizeSwitchRoomNames() {
 			def loc = state.switchIdToLocationMap[id]
 			def device = getDevicesById(id, settings.controlledSwitches)
 			if (loc && device?.displayName) {
-				 switchInfoForGroup << [id: id, displayName: device.displayName, parsedRoomName: loc.roomName, effectiveName: loc.effectiveNameUsedForParsing]
+				 switchInfoForGroup << [id: id, displayName: device.displayName, parsedRoomName: loc.roomName, effectiveName: loc.parsingName]
 			}
 		}
 		
@@ -492,12 +492,12 @@ def buildDeviceMaps() {
 			return
 		}
 		
-		String actualDisplayName = sw.displayName?.trim() ?: ""
+		String actualDisplayName = (sw.displayName?.trim() ?: "").replaceFirst(/((?i)\bSwitch\b).*/, '$1').trim()
 		String parsedRoom = switchLoc.roomName
 		String parsedArea = switchLoc.areaName
 		String type = "unknown"
 		String stem = null
-		String stemSourceDisplay = getEffectiveDeviceNameForMatching(sw)
+		String stemSourceDisplay = (sw)
 
 		if (actualDisplayName.toLowerCase().endsWith(" all switch")) {
 			type = "all"
@@ -563,7 +563,7 @@ def buildDeviceMaps() {
 			List<String> currentAreaLightIds = []
 			settings.controlledLightsAndScenes?.each { targetDev ->
 				if (!isScene(targetDev)) {
-					String targetEffectiveName = getEffectiveDeviceNameForMatching(targetDev)
+					String targetEffectiveName = (targetDev)
 					if (targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
 						currentAreaLightIds << targetDev.id.toString()
 					}
@@ -622,7 +622,7 @@ def buildDeviceMaps() {
 		List<String> currentSceneIds = []
 		settings.controlledLightsAndScenes?.each { targetDev ->
 			if (isScene(targetDev)) {
-				String targetEffectiveName = getEffectiveDeviceNameForMatching(targetDev)
+				String targetEffectiveName = (targetDev)
 				if (stem && targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
 					currentSceneIds << targetDev.id.toString()
 				}
@@ -660,7 +660,7 @@ def buildDeviceMaps() {
 
 			settings.controlledLightsAndScenes?.each { targetDev ->
 				if (isScene(targetDev)) {
-					String targetEffectiveName = getEffectiveDeviceNameForMatching(targetDev)
+					String targetEffectiveName = (targetDev)
 					if (targetEffectiveName.toLowerCase().startsWith(zoneNamePrefix.toLowerCase())) {
 						zoneSceneIds << targetDev.id.toString()
 					}
