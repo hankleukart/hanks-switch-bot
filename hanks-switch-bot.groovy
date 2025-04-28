@@ -1,5 +1,5 @@
 /**
-* Hank's Switch Bot v04-27-2025
+* Hank's Switch Bot v04-28-2025
 * Copyright 2025 Hank Leukart
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -468,12 +468,12 @@ def buildDeviceMaps() {
 	log.info "Starting buildDeviceMaps..."
 	// Initialize state collections for storing mappings.
 	// These are maps where the key is the switch ID.
-	state.switchRoomLights = [:]           // Lights in the same room as the switch
-	state.switchAreaLights = [:]           // Specific lights controlled by the switch (stem-based or master)
-	state.switchZoneLights = [:]           // Lights in the same zone as the switch
-	state.switchScenes = [:]               // Scenes associated with the switch by stem or zone
-	state.firstAreaLightToSwitch = [:]     // Maps a primary light ID back to its controlling switch ID (for state syncing)
-	state.sortedSwitchSceneIds = [:]       // Sorted list of scene IDs for each switch
+	state.switchRoomLights = [:]            // Lights in the same room as the switch
+	state.switchAreaLights = [:]            // Specific lights controlled by the switch (stem-based or master)
+	state.switchZoneLights = [:]            // Lights in the same zone as the switch
+	state.switchScenes = [:]                // Scenes associated with the switch by stem or zone
+	state.firstAreaLightToSwitch = [:]      // Maps a primary light ID back to its controlling switch ID (for state syncing)
+	state.sortedSwitchSceneIds = [:]        // Sorted list of scene IDs for each switch
 	state.switchDimmableAreaLightIds = [:] // List of dimmable light IDs from switchAreaLights
 
 	// Pre-parse locations for all lights and scenes to avoid redundant parsing.
@@ -568,7 +568,8 @@ def buildDeviceMaps() {
 		}
 	}
 
-	Set<String> allRegularlyMappedLightIds = new HashSet<>() // Keeps track of lights assigned to regular/all switches
+	// Map to store which regular/all switch claimed which light. Key: lightId, Value: switchId
+	Map<String, String> regularlyClaimedLightToSwitchMap = [:] 
 
 	// Initialize area light and dimmable light lists for all switches that have a stem (are in switchInfoMap)
 	switchInfoMap.each { switchId, sInfo ->
@@ -576,7 +577,7 @@ def buildDeviceMaps() {
 		state.switchDimmableAreaLightIds[switchId] = []
 	}
 	
-	// Pass 1: Process "regular" and "all" switches to populate their area lights and allRegularlyMappedLightIds
+	// Pass 1: Process "regular" and "all" switches to populate their area lights and regularlyClaimedLightToSwitchMap
 	switchInfoMap.each { switchId, sInfo ->
 		if (sInfo.type == "regular" || sInfo.type == "all") {
 			String stem = sInfo.stem
@@ -592,7 +593,11 @@ def buildDeviceMaps() {
 			}
 			currentAreaLightIds = currentAreaLightIds.unique()
 			state.switchAreaLights[switchId] = currentAreaLightIds // Assign lights to this switch
-			allRegularlyMappedLightIds.addAll(currentAreaLightIds) // Add to the set of claimed lights
+			
+			// Record which switch claimed these lights
+			currentAreaLightIds.each { lightId ->
+				regularlyClaimedLightToSwitchMap[lightId] = switchId 
+			}
 
 			if (!currentAreaLightIds.isEmpty()) {
 				def areaLightObjects = getDevicesById(currentAreaLightIds, settings.controlledLightsAndScenes)
@@ -609,21 +614,36 @@ def buildDeviceMaps() {
 		}
 	}
 
-	// Pass 2: Process "master" switches, assigning only lights not already in allRegularlyMappedLightIds
-	switchInfoMap.each { switchId, sInfo ->
+	// Pass 2: Process "master" switches, assigning lights not already claimed by non-sibling regular/all switches
+	switchInfoMap.each { switchId, sInfo -> // switchId is the ID of the current master switch
 		if (sInfo.type == "master") {
 			String masterSwitchRoom = sInfo.stem // For master switches, stem is the roomName
 			List<String> masterLightIds = []
+			List<String> siblingsOfThisMaster = state.siblingSwitchGroupsBySwitchId[switchId] ?: [switchId]
+
 			settings.controlledLightsAndScenes?.each { targetDev ->
-				if (!isScene(targetDev) && targetDev?.id && !allRegularlyMappedLightIds.contains(targetDev.id.toString())) { // CRITICAL CHECK
+				if (!isScene(targetDev) && targetDev?.id) { 
 					def targetLoc = lightSceneLocations[targetDev.id.toString()]
 					if (targetLoc?.roomName && targetLoc.roomName.equalsIgnoreCase(masterSwitchRoom)) {
-						masterLightIds << targetDev.id.toString()
+						String claimingSwitchId = regularlyClaimedLightToSwitchMap[targetDev.id.toString()]
+						boolean canMasterClaimThisLight = true 
+
+						if (claimingSwitchId != null) { // Light IS claimed by a regular/all switch
+							// Master can only claim it if the claiming switch is a sibling
+							if (!siblingsOfThisMaster.contains(claimingSwitchId)) {
+								canMasterClaimThisLight = false // Claimed by a non-sibling regular/all switch
+							}
+						}
+						// If claimingSwitchId is null (not claimed) or claimed by a sibling, master can control it.
+
+						if (canMasterClaimThisLight) {
+							masterLightIds << targetDev.id.toString()
+						}
 					}
 				}
 			}
 			masterLightIds = masterLightIds.unique()
-			state.switchAreaLights[switchId] = masterLightIds // Assign remaining lights to this master switch
+			state.switchAreaLights[switchId] = masterLightIds // Assign allowed lights to this master switch
 			
 			if (!masterLightIds.isEmpty()) {
 				 def masterLightObjects = getDevicesById(masterLightIds, settings.controlledLightsAndScenes)
@@ -635,6 +655,7 @@ def buildDeviceMaps() {
 				 if (sortedMasterLightObjects && !sortedMasterLightObjects.isEmpty()) {
 					def firstMasterLightId = sortedMasterLightObjects.first().id.toString()
 					// Master switch's first light is a candidate only if not already claimed by a regular/all switch
+					// (or if it is, this master switch will not overwrite the existing entry from a regular/all switch)
 					if (!state.firstAreaLightToSwitch.containsKey(firstMasterLightId)) {
 						state.firstAreaLightToSwitch[firstMasterLightId] = switchId
 					}
@@ -720,9 +741,8 @@ def buildDeviceMaps() {
 		}
 	}
 
-	log.info "buildDeviceMaps finished. Pre-sorted scenes and pre-filtered dimmable lights. Zone scene fallback applied."
+	log.info "buildDeviceMaps finished. Pre-sorted scenes and pre-filtered dimmable lights. Zone scene fallback applied. Master switch sibling logic updated."
 }
-
 
 def buildModeSettingsMap() {
 	def newModeSettings = [:]
