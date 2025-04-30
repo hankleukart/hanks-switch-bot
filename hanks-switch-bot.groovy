@@ -1,5 +1,5 @@
 /**
-* Hank's Switch Bot v04-28-2025
+* Hank's Switch Bot v04-29-2025
 * Copyright 2025 Hank Leukart
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -66,7 +66,7 @@ preferences {
 
 				Integer conditionalDefaultLevel = null
 				Integer conditionalDefaultCt = null
-				Boolean conditionalEnableCt = true
+				Boolean conditionalEnableCt = true // Default to true
 
 				if (currentModeNameLower == "evening") {
 					conditionalDefaultLevel = 100
@@ -101,8 +101,8 @@ preferences {
 					name: "enableCt_${safeModeName}",
 					type: "bool",
 					title: "Set CT for '${mode.name}'?",
-					defaultValue: conditionalEnableCt,
-					required: false,
+					defaultValue: conditionalEnableCt, // Will be true unless user unchecks
+					required: false, // Explicitly false, default is true for bools if not set
 					width: 4
 				)
 			}
@@ -206,8 +206,23 @@ def installed() {
 
 def updated() {
 	log.info "Updated Hank's Switch Bot"
-	unsubscribe()
+	unsubscribeAndUnschedule() // Clear old subscriptions and schedules
 	initialize()
+}
+
+def uninstalled() {
+	log.info "Uninstalling Hank's Switch Bot"
+	unsubscribeAndUnschedule() // Clear all subscriptions and schedules
+}
+
+private void unsubscribeAndUnschedule() {
+	log.info "Clearing all subscriptions and schedules for Hank's Switch Bot"
+	try {
+		unsubscribe() // Platform magic: removes all event subscriptions for this app instance
+		unschedule()  // Platform magic: removes all schedules for this app instance
+	} catch (e) {
+		log.error "Error during unsubscribe/unschedule: ${e.message}"
+	}
 }
 
 def initialize() {
@@ -215,6 +230,7 @@ def initialize() {
 	state.sceneMode = [:]
 	state.sceneTimeoutJob = [:]
 	state.modeSettingsMap = [:]
+	state.currentLocationMode = null // Initialize tracked mode
 	state.switchControlSummary = "Initializing or no switches configured..."
 	state.siblingSwitchGroupsBySwitchId = [:]
 	state.switchIdToLocationMap = [:]
@@ -283,10 +299,24 @@ def initialize() {
 				if (lightDevice.hasCapability("Switch")) {
 					 subscribe(lightDevice, "switch", firstLightStateHandler)
 				}
+				if (lightDevice.hasCapability("ColorTemperature")) {
+					subscribe(lightDevice, "colorTemperature", firstLightStateHandler)
+				}
 			} else {
 				log.warn "Could not find first area light device with ID ${lightId} to subscribe for state sync."
 			}
 		}
+	}
+	
+	// Set initial tracked mode
+	state.currentLocationMode = location.currentMode?.name?.toString()?.trim()
+	log.info "Initial location mode tracked as: ${state.currentLocationMode ?: 'UNKNOWN (Hubitat returned no current mode)'}"
+
+	// Subscribe to mode changes
+	try {
+		subscribe(location, "mode", modeChangeHandler)
+	} catch (e) {
+		log.error "Error subscribing to location mode changes: ${e.message}"
 	}
 
 	updateSwitchControlSummary()
@@ -360,7 +390,6 @@ def parseDeviceLocation(device) {
 			}
 		}
 	}
-	// log.trace "parseDeviceLocation for '${device?.displayName}' (Name: '${device?.name}'): Room='${roomName}', Area='${areaName}', Zone='${zoneName}', EffectiveName='${baseDisplayNameForParsing}'"
 	return [roomName: roomName?.trim(), areaName: areaName?.trim(), zoneName: zoneName, parsingName: baseDisplayNameForParsing]
 }
 
@@ -466,62 +495,52 @@ private void groupSiblingSwitches() {
 
 def buildDeviceMaps() {
 	log.info "Starting buildDeviceMaps..."
-	// Initialize state collections for storing mappings.
-	// These are maps where the key is the switch ID.
-	state.switchRoomLights = [:]            // Lights in the same room as the switch
-	state.switchAreaLights = [:]            // Specific lights controlled by the switch (stem-based or master)
-	state.switchZoneLights = [:]            // Lights in the same zone as the switch
-	state.switchScenes = [:]                // Scenes associated with the switch by stem or zone
-	state.firstAreaLightToSwitch = [:]      // Maps a primary light ID back to its controlling switch ID (for state syncing)
-	state.sortedSwitchSceneIds = [:]        // Sorted list of scene IDs for each switch
-	state.switchDimmableAreaLightIds = [:] // List of dimmable light IDs from switchAreaLights
+	state.switchRoomLights = [:]
+	state.switchAreaLights = [:]
+	state.switchZoneLights = [:]
+	state.switchScenes = [:]
+	state.firstAreaLightToSwitch = [:]
+	state.sortedSwitchSceneIds = [:]
+	state.switchDimmableAreaLightIds = [:]
 
-	// Pre-parse locations for all lights and scenes to avoid redundant parsing.
-	// Stores a map of [deviceIdString: locationMap], where locationMap is {roomName, areaName, zoneName, parsingName}
 	Map lightSceneLocations = [:]
 	settings.controlledLightsAndScenes?.each { dev ->
-		if (dev?.id) { // Ensure device and ID are not null
+		if (dev?.id) {
 			lightSceneLocations[dev.id.toString()] = parseDeviceLocation(dev)
 		}
 	}
 
-	// Build a map of switch information (type, stem, location) for easier processing.
-	// Key: switchId (String), Value: Map {type, stem, loc, displayName}
 	Map switchInfoMap = [:]
 	settings.controlledSwitches?.each { sw ->
-		if (!sw?.id) return // Skip if switch or its ID is null
+		if (!sw?.id) return
 
 		def switchId = sw.id.toString()
-		def switchLoc = state.switchIdToLocationMap[switchId] // Location info parsed during initialize()
+		def switchLoc = state.switchIdToLocationMap[switchId]
 
 		if (!switchLoc) {
 			log.warn "buildDeviceMaps: No location info for switch ID ${switchId} ('${sw.displayName}'). Skipping stem calculation for this switch."
-			// Ensure essential state maps have entries for this switch to prevent errors later
 			state.switchAreaLights[switchId] = []
 			state.switchScenes[switchId] = []
 			state.sortedSwitchSceneIds[switchId] = []
 			state.switchDimmableAreaLightIds[switchId] = []
-			return // Continue to next switch
+			return
 		}
 		
-		// Determine the base name of the switch for stem calculation (e.g., "Kitchen Ceiling" from "Kitchen Ceiling Switch")
 		String actualDisplayName = (sw.displayName?.trim() ?: "").replaceFirst(/((?i)\bSwitch\b).*/, '$1').trim()
 		String parsedRoom = switchLoc.roomName
 		String parsedArea = switchLoc.areaName
-		String type = "unknown" // Switch type: regular, master, all
-		String stem = null      // The base name used for matching lights/scenes (e.g., "Kitchen Ceiling" or "Kitchen")
-		String stemSourceDisplay = sw.displayName ?: "" // Use full display name for stem source of regular switches
+		String type = "unknown"
+		String stem = null
+		String stemSourceDisplay = sw.displayName ?: ""
 
-		// Determine switch type and stem based on naming conventions
 		if (actualDisplayName.toLowerCase().endsWith(" all switch")) {
-			type = "all" // Example: "Kitchen All Switch"
-			stem = parsedRoom // Stem for "All" switches is the room name
+			type = "all"
+			stem = parsedRoom
 		} else if (actualDisplayName.toLowerCase().endsWith(" switch") && (parsedArea == null || parsedArea.isEmpty() || parsedArea.equalsIgnoreCase("all"))) {
-			type = "master" // Example: "Kitchen Switch" (implies master for the kitchen)
-			stem = parsedRoom // Stem for master switches is the room name
+			type = "master"
+			stem = parsedRoom
 		} else if (actualDisplayName.toLowerCase().endsWith(" switch")) {
-			type = "regular" // Example: "Kitchen Ceiling Switch"
-			// Stem for regular switches is the name part before " Switch"
+			type = "regular"
 			stem = stemSourceDisplay.substring(0, stemSourceDisplay.toLowerCase().lastIndexOf(" switch")).trim()
 		}
 		
@@ -529,7 +548,6 @@ def buildDeviceMaps() {
 			switchInfoMap[switchId] = [type: type, stem: stem, loc: switchLoc, displayName: actualDisplayName]
 		} else {
 			log.info "buildDeviceMaps: Switch '${actualDisplayName}' (ID: ${switchId}) did not generate a stem. It will rely on zone scenes if applicable."
-			// Initialize state for switches without stems
 			state.switchAreaLights[switchId] = []
 			state.switchScenes[switchId] = []
 			state.sortedSwitchSceneIds[switchId] = []
@@ -537,22 +555,19 @@ def buildDeviceMaps() {
 		}
 	}
 
-	// Assign Room Lights and Zone Lights (common for all switch types)
 	settings.controlledSwitches?.each { sw ->
 		if (!sw?.id) return
 		def switchId = sw.id.toString()
 		def sLoc = state.switchIdToLocationMap[switchId]
 
-		if (!sLoc) return // Already logged if switchLoc was null during switchInfoMap creation
+		if (!sLoc) return
 
-		// Assign all non-scene devices in the same room to switchRoomLights
 		state.switchRoomLights[switchId] = settings.controlledLightsAndScenes?.findAll { light ->
 			if (isScene(light) || !light?.id) return false
 			def targetLoc = lightSceneLocations[light.id.toString()]
 			return targetLoc?.roomName && sLoc?.roomName && targetLoc.roomName.equalsIgnoreCase(sLoc.roomName)
 		}?.collect { it.id.toString() } ?: []
 
-		// Assign all non-scene devices in the same zone to switchZoneLights
 		if (sLoc?.zoneName) {
 			List<String> currentZoneLightIds = settings.controlledLightsAndScenes?.findAll { light ->
 				if (isScene(light) || !light?.id) return false
@@ -568,23 +583,19 @@ def buildDeviceMaps() {
 		}
 	}
 
-	// Map to store which regular/all switch claimed which light. Key: lightId, Value: switchId
-	Map<String, String> regularlyClaimedLightToSwitchMap = [:] 
+	Map<String, String> regularlyClaimedLightToSwitchMap = [:]
 
-	// Initialize area light and dimmable light lists for all switches that have a stem (are in switchInfoMap)
 	switchInfoMap.each { switchId, sInfo ->
 		state.switchAreaLights[switchId] = []
 		state.switchDimmableAreaLightIds[switchId] = []
 	}
 	
-	// Pass 1: Process "regular" and "all" switches to populate their area lights and regularlyClaimedLightToSwitchMap
 	switchInfoMap.each { switchId, sInfo ->
 		if (sInfo.type == "regular" || sInfo.type == "all") {
 			String stem = sInfo.stem
 			List<String> currentAreaLightIds = []
 			settings.controlledLightsAndScenes?.each { targetDev ->
 				if (!isScene(targetDev) && targetDev?.id) {
-					// Use the consistent parsingName from lightSceneLocations
 					String targetEffectiveName = lightSceneLocations[targetDev.id.toString()]?.parsingName
 					if (targetEffectiveName && stem && targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
 						currentAreaLightIds << targetDev.id.toString()
@@ -592,11 +603,10 @@ def buildDeviceMaps() {
 				}
 			}
 			currentAreaLightIds = currentAreaLightIds.unique()
-			state.switchAreaLights[switchId] = currentAreaLightIds // Assign lights to this switch
+			state.switchAreaLights[switchId] = currentAreaLightIds
 			
-			// Record which switch claimed these lights
 			currentAreaLightIds.each { lightId ->
-				regularlyClaimedLightToSwitchMap[lightId] = switchId 
+				regularlyClaimedLightToSwitchMap[lightId] = switchId
 			}
 
 			if (!currentAreaLightIds.isEmpty()) {
@@ -607,35 +617,30 @@ def buildDeviceMaps() {
 				
 				def sortedAreaLightObjects = areaLightObjects?.sort { it.displayName }
 				if (sortedAreaLightObjects && !sortedAreaLightObjects.isEmpty()) {
-					 // The first light of a regular/all switch is a candidate for state syncing
 					 state.firstAreaLightToSwitch[sortedAreaLightObjects.first().id.toString()] = switchId
 				}
 			}
 		}
 	}
 
-	// Pass 2: Process "master" switches, assigning lights not already claimed by non-sibling regular/all switches
-	switchInfoMap.each { switchId, sInfo -> // switchId is the ID of the current master switch
+	switchInfoMap.each { switchId, sInfo ->
 		if (sInfo.type == "master") {
-			String masterSwitchRoom = sInfo.stem // For master switches, stem is the roomName
+			String masterSwitchRoom = sInfo.stem
 			List<String> masterLightIds = []
 			List<String> siblingsOfThisMaster = state.siblingSwitchGroupsBySwitchId[switchId] ?: [switchId]
 
 			settings.controlledLightsAndScenes?.each { targetDev ->
-				if (!isScene(targetDev) && targetDev?.id) { 
+				if (!isScene(targetDev) && targetDev?.id) {
 					def targetLoc = lightSceneLocations[targetDev.id.toString()]
 					if (targetLoc?.roomName && targetLoc.roomName.equalsIgnoreCase(masterSwitchRoom)) {
 						String claimingSwitchId = regularlyClaimedLightToSwitchMap[targetDev.id.toString()]
-						boolean canMasterClaimThisLight = true 
+						boolean canMasterClaimThisLight = true
 
-						if (claimingSwitchId != null) { // Light IS claimed by a regular/all switch
-							// Master can only claim it if the claiming switch is a sibling
+						if (claimingSwitchId != null) {
 							if (!siblingsOfThisMaster.contains(claimingSwitchId)) {
-								canMasterClaimThisLight = false // Claimed by a non-sibling regular/all switch
+								canMasterClaimThisLight = false
 							}
 						}
-						// If claimingSwitchId is null (not claimed) or claimed by a sibling, master can control it.
-
 						if (canMasterClaimThisLight) {
 							masterLightIds << targetDev.id.toString()
 						}
@@ -643,7 +648,7 @@ def buildDeviceMaps() {
 				}
 			}
 			masterLightIds = masterLightIds.unique()
-			state.switchAreaLights[switchId] = masterLightIds // Assign allowed lights to this master switch
+			state.switchAreaLights[switchId] = masterLightIds
 			
 			if (!masterLightIds.isEmpty()) {
 				 def masterLightObjects = getDevicesById(masterLightIds, settings.controlledLightsAndScenes)
@@ -654,32 +659,25 @@ def buildDeviceMaps() {
 				 def sortedMasterLightObjects = masterLightObjects?.sort { it.displayName }
 				 if (sortedMasterLightObjects && !sortedMasterLightObjects.isEmpty()) {
 					def firstMasterLightId = sortedMasterLightObjects.first().id.toString()
-					// Master switch's first light is a candidate only if not already claimed by a regular/all switch
-					// (or if it is, this master switch will not overwrite the existing entry from a regular/all switch)
 					if (!state.firstAreaLightToSwitch.containsKey(firstMasterLightId)) {
 						state.firstAreaLightToSwitch[firstMasterLightId] = switchId
 					}
 				 }
 			}
-			// If masterLightIds is empty, switchDimmableAreaLightIds[switchId] remains [], which is correct.
 		}
 	}
 
-	// Assign Scenes based on stems (applies to all switch types that generated a stem)
 	switchInfoMap.each { switchId, sInfo ->
 		String stem = sInfo.stem
 		List<String> currentSceneIds = []
 		settings.controlledLightsAndScenes?.each { targetDev ->
 			if (isScene(targetDev) && targetDev?.id) {
-				// Use the consistent parsingName from lightSceneLocations
 				String targetEffectiveName = lightSceneLocations[targetDev.id.toString()]?.parsingName
 				if (stem && targetEffectiveName && targetEffectiveName.toLowerCase().startsWith(stem.toLowerCase())) {
 					currentSceneIds << targetDev.id.toString()
 				}
 			}
 		}
-		// Ensure state.switchScenes and state.sortedSwitchSceneIds are initialized for this switchId
-		// even if they were initialized earlier for switches without stems.
 		state.switchScenes[switchId] = currentSceneIds.unique()
 
 		if (!currentSceneIds.isEmpty()) {
@@ -690,7 +688,6 @@ def buildDeviceMaps() {
 		}
 	}
 
-	// Fallback: Assign Zone-Specific Scenes for switches that have a zone AND no primary (stem-based) scenes.
 	log.info "Starting check for zone-specific scenes for switches without primary (stem-based) scenes..."
 	settings.controlledSwitches?.each { sw ->
 		if (!sw?.id) return
@@ -698,12 +695,10 @@ def buildDeviceMaps() {
 		def switchLoc = state.switchIdToLocationMap[switchId]
 		def switchDisplayName = sw.displayName ?: "Switch ID ${switchId}"
 
-		// Ensure sortedSwitchSceneIds has an entry, even if empty, before checking its emptiness.
-		// This handles cases where a switch might not have been processed by switchInfoMap (e.g. no stem).
 		if (state.sortedSwitchSceneIds[switchId] == null) {
 			state.sortedSwitchSceneIds[switchId] = []
 		}
-		if (state.switchScenes[switchId] == null) { // Also ensure switchScenes is initialized
+		if (state.switchScenes[switchId] == null) {
 			 state.switchScenes[switchId] = []
 		}
 
@@ -712,13 +707,11 @@ def buildDeviceMaps() {
 		if (switchLoc?.zoneName && !hasPrimaryScenes) {
 			log.info "Switch '${switchDisplayName}' (ID: ${switchId}) has zone '${switchLoc.zoneName}' and no primary scenes. Checking for zone-specific scenes."
 			List<String> zoneSceneIds = []
-			String zoneNamePrefix = switchLoc.zoneName // Zone name itself is the prefix for scene names
+			String zoneNamePrefix = switchLoc.zoneName
 
 			settings.controlledLightsAndScenes?.each { targetDev ->
 				if (isScene(targetDev) && targetDev?.id) {
-					// Use the consistent parsingName from lightSceneLocations
 					String targetEffectiveName = lightSceneLocations[targetDev.id.toString()]?.parsingName
-					// Match if scene name starts with the zone name
 					if (targetEffectiveName && zoneNamePrefix && targetEffectiveName.toLowerCase().startsWith(zoneNamePrefix.toLowerCase())) {
 						zoneSceneIds << targetDev.id.toString()
 					}
@@ -727,9 +720,8 @@ def buildDeviceMaps() {
 
 			if (!zoneSceneIds.isEmpty()) {
 				List<String> uniqueZoneSceneIds = zoneSceneIds.unique()
-				// These zone scenes become the primary scenes for this switch
-				state.switchScenes[switchId].addAll(uniqueZoneSceneIds) // Add to existing, though it should be empty due to !hasPrimaryScenes
-				state.switchScenes[switchId] = state.switchScenes[switchId].unique() // Ensure uniqueness again
+				state.switchScenes[switchId].addAll(uniqueZoneSceneIds)
+				state.switchScenes[switchId] = state.switchScenes[switchId].unique()
 
 				def zoneSceneDeviceObjects = getDevicesById(state.switchScenes[switchId], settings.controlledLightsAndScenes)
 				state.sortedSwitchSceneIds[switchId] = zoneSceneDeviceObjects?.sort { it.displayName }?.collect { it.id.toString() } ?: []
@@ -740,7 +732,6 @@ def buildDeviceMaps() {
 			}
 		}
 	}
-
 	log.info "buildDeviceMaps finished. Pre-sorted scenes and pre-filtered dimmable lights. Zone scene fallback applied. Master switch sibling logic updated."
 }
 
@@ -756,6 +747,7 @@ def buildModeSettingsMap() {
 			Integer modeCtSetting = settings."ct_${safeModeName}"
 			Boolean modeEnableCtSetting = settings."enableCt_${safeModeName}" != null ? settings."enableCt_${safeModeName}" : true
 
+
 			Integer validLevel = (modeLevelSetting != null && modeLevelSetting >= 1 && modeLevelSetting <= 100) ? modeLevelSetting : null
 			Integer validCt = (modeCtSetting != null && modeCtSetting >= 2000 && modeCtSetting <= 9000) ? modeCtSetting : null
 
@@ -764,6 +756,123 @@ def buildModeSettingsMap() {
 	}
 	state.modeSettingsMap = newModeSettings
 }
+
+// Handles Hubitat mode changes
+def modeChangeHandler(evt) {
+	// Use state for old mode, event for new mode
+	String previousModeName = state.currentLocationMode 
+	String newModeName = evt.value?.toString()?.trim()
+
+	log.info "Mode change event. Tracked previous mode: '${previousModeName ?: 'NONE (UNINITIALIZED)'}', New mode from event: '${newModeName ?: 'NONE (INVALID EVENT VALUE)'}'"
+
+	if (!newModeName) { // New mode from event is invalid
+		log.warn "New mode from event is invalid (null or empty). No action taken. Event value: '${evt.value}'"
+		// DO NOT update state.currentLocationMode as the new mode is not valid
+		return
+	}
+
+	if (newModeName == previousModeName) { // No actual change
+		log.info "New mode '${newModeName}' is the same as the tracked current mode. No action taken."
+		// state.currentLocationMode is already correct, no update needed
+		return
+	}
+
+	// At this point, newModeName is valid and different from previousModeName.
+	// previousModeName *could* be null if this is the first mode change seen by the app
+	// and location.currentMode was initially null or not yet set in state.
+
+	if (previousModeName == null) {
+		log.info "No previously tracked mode (was UNINITIALIZED/NULL). This is likely the first mode change processed. "+
+				 "Updating tracked mode to '${newModeName}' and skipping light adjustments for this initial transition."
+		state.currentLocationMode = newModeName // Update to the first valid mode seen
+		return
+	}
+
+	// --- Main logic: previousModeName is valid, newModeName is valid and different ---
+	log.info "Processing mode change from (tracked) '${previousModeName}' to (event) '${newModeName}'"
+
+	Map previousModeSettings = getModeSettings(previousModeName) // previousModeName is guaranteed not null here
+	Map newModeSettings = getModeSettings(newModeName)
+
+	log.debug "Previous mode ('${previousModeName}') settings: Level=${previousModeSettings.level}, CT=${previousModeSettings.ct}, EnableCT=${previousModeSettings.enableCt}"
+	log.debug "New mode ('${newModeName}') settings: Level=${newModeSettings.level}, CT=${newModeSettings.ct}, EnableCT=${newModeSettings.enableCt}"
+
+	settings.controlledLightsAndScenes.each { lightDevice ->
+		if (isScene(lightDevice) || !lightDevice.hasCapability("Switch")) {
+			return // Skip scenes or devices that can't be switched
+		}
+
+		if (lightDevice.currentValue('switch') == 'on') {
+			// Check if light matched previous mode settings
+			boolean brightnessMatches = false
+			if (lightDevice.hasCapability("SwitchLevel")) {
+				Integer currentLevel = lightDevice.currentValue('level') as Integer
+				brightnessMatches = (currentLevel == previousModeSettings.level)
+				// log.trace "Light ${lightDevice.displayName}: Dimmable. CurrentLevel=${currentLevel}, PrevModeLevel=${previousModeSettings.level}. BrightnessMatch=${brightnessMatches}"
+			} else { // Non-dimmable switch
+				 brightnessMatches = (previousModeSettings.level > 0) // Considered match if previous mode implied "ON"
+				 // log.trace "Light ${lightDevice.displayName}: Non-dimmable. PrevModeLevel=${previousModeSettings.level}. BrightnessMatch=${brightnessMatches} (if >0)"
+			}
+
+			boolean ctMatches = false
+			if (!previousModeSettings.enableCt) {
+				ctMatches = true // Previous mode didn't care about CT
+				// log.trace "Light ${lightDevice.displayName}: PrevMode did not enable CT. CTMatch=true."
+			} else { // Previous mode *did* want to set CT (and previousModeSettings.ct is a non-null value)
+				if (lightDevice.hasCapability("ColorTemperature")) {
+					def currentCtValue = lightDevice.currentValue('colorTemperature')
+					if (currentCtValue != null) { // Light has a current CT value
+						Integer currentCtInteger = currentCtValue as Integer
+						ctMatches = (Math.abs(currentCtInteger - (previousModeSettings.ct as Integer)) <= 10)
+						// log.trace "Light ${lightDevice.displayName}: CT Capable. CurrentCT=${currentCtInteger}, PrevModeCT=${previousModeSettings.ct}. CTMatch=${ctMatches} (Tolerance 10K)."
+					} else { // Light has CT capability, but current CT is null. Prev mode expected a value.
+						ctMatches = false
+						// log.trace "Light ${lightDevice.displayName}: CT Capable. CurrentCT is null, PrevModeCT=${previousModeSettings.ct}. CTMatch=false."
+					}
+				} else { // Light does not have CT capability, but prev mode expected it.
+					ctMatches = false
+					// log.trace "Light ${lightDevice.displayName}: Not CT Capable, but PrevMode enabled CT. CTMatch=false."
+				}
+			}
+
+			if (brightnessMatches && ctMatches) {
+				log.info "Light ${lightDevice.displayName} (ON) matched previous mode '${previousModeName}' settings. Adjusting to new mode '${newModeName}'."
+
+				try {
+					// Apply new settings
+					if (lightDevice.hasCapability("SwitchLevel")) {
+						log.debug "Setting ${lightDevice.displayName} level to ${newModeSettings.level}"
+						lightDevice.setLevel(newModeSettings.level) // setLevel usually also turns on the light if level > 0
+					} else { // Non-dimmable, ensure it's on if new mode implies on
+						if (newModeSettings.level > 0) {
+							log.debug "Setting ${lightDevice.displayName} ON (non-dimmable)"
+							lightDevice.on()
+						} else { // New mode implies light should be off
+							 log.debug "Setting ${lightDevice.displayName} OFF (non-dimmable, new mode level is 0)"
+							 lightDevice.off()
+						}
+					}
+
+					if (newModeSettings.enableCt && lightDevice.hasCapability("ColorTemperature")) {
+						// newModeSettings.ct is guaranteed non-null if newModeSettings.enableCt is true
+						log.debug "Setting ${lightDevice.displayName} CT to ${newModeSettings.ct}"
+						lightDevice.setColorTemperature(newModeSettings.ct)
+					}
+				} catch (e) {
+					log.error "Error adjusting light ${lightDevice.displayName} to new mode settings: ${e.message}"
+				}
+			} else {
+				 // log.trace "Light ${lightDevice.displayName} is ON but did not match previous mode settings. BrightnessMatch=${brightnessMatches}, CTMatch=${ctMatches}. No changes applied by modeChangeHandler."
+			}
+		}
+	}
+	// --- End of original logic ---
+
+	// Update the tracked current mode after successfully processing the changes
+	state.currentLocationMode = newModeName
+	log.info "Successfully processed mode changes. Tracked mode updated to '${state.currentLocationMode}'."
+}
+
 
 def firstLightStateHandler(evt) {
 	def triggeringLight = evt.device
@@ -774,16 +883,20 @@ def firstLightStateHandler(evt) {
 	def primarySwitchId = state.firstAreaLightToSwitch[lightId]
 	if (!primarySwitchId) return
 
-	log.info "firstLightStateHandler for ${triggeringLight.displayName} (ID: ${lightId}): Event ${eventName}=${eventValue}."
+	if (eventName == "switch" || eventName == "level") {
+		log.info "firstLightStateHandler for ${triggeringLight.displayName} (ID: ${lightId}): Event ${eventName}=${eventValue}."
+	}
 	
 	Map siblingGroupsMap = state.siblingSwitchGroupsBySwitchId ?: [:]
 	List<String> switchIdsToUpdate = siblingGroupsMap[primarySwitchId] ?: [primarySwitchId]
 	
-	if (switchIdsToUpdate.size() > 1 || (switchIdsToUpdate.size() == 1 && switchIdsToUpdate.first() != primarySwitchId)) {
-		def names = switchIdsToUpdate.collect { getDevicesById(it, settings.controlledSwitches)?.displayName ?: it }.join(', ')
-		log.info "Syncing switch(es): ${names} due to change on primary logical switch ${getDevicesById(primarySwitchId, settings.controlledSwitches)?.displayName ?: primarySwitchId}."
-	} else {
-		log.info "Syncing switch ${getDevicesById(primarySwitchId, settings.controlledSwitches)?.displayName ?: primarySwitchId}."
+	if (eventName == "switch" || eventName == "level") {
+		if (switchIdsToUpdate.size() > 1 || (switchIdsToUpdate.size() == 1 && switchIdsToUpdate.first() != primarySwitchId)) {
+			def names = switchIdsToUpdate.collect { getDevicesById(it, settings.controlledSwitches)?.displayName ?: it }.join(', ')
+			log.info "Syncing switch(es): ${names} due to change on primary logical switch ${getDevicesById(primarySwitchId, settings.controlledSwitches)?.displayName ?: primarySwitchId}."
+		} else {
+			log.info "Syncing switch ${getDevicesById(primarySwitchId, settings.controlledSwitches)?.displayName ?: primarySwitchId}."
+		}
 	}
 
 	switchIdsToUpdate.each { switchIdToSync ->
@@ -842,40 +955,53 @@ def buttonHandler(evt) {
 	}
 }
 
-private void handleSceneModeAction(triggeringSwitch, buttonNumber, buttonEvent) {
+private boolean cycleScene(triggeringSwitch, String direction = "next") {
 	def switchId = triggeringSwitch.id.toString()
 	def sortedSceneIds = state.sortedSwitchSceneIds[switchId]
+
 	if (!sortedSceneIds || sortedSceneIds.isEmpty()) {
-		log.warn "handleSceneModeAction: No sorted scenes for ${triggeringSwitch.displayName}. Exiting scene mode."
-		exitSceneMode([switchId: switchId]); return
+		log.warn "cycleScene: No sorted scenes for ${triggeringSwitch.displayName}."
+		return false
 	}
 
 	def roomScenes = getDevicesById(sortedSceneIds, settings.controlledLightsAndScenes)
 	if (!roomScenes || roomScenes.empty) {
-		log.warn "handleSceneModeAction: Could not retrieve scene devices for ${triggeringSwitch.displayName} using sorted IDs. Exiting scene mode."
-		exitSceneMode([switchId: switchId]); return
+		log.warn "cycleScene: Could not retrieve scene devices for ${triggeringSwitch.displayName} using sorted IDs."
+		return false
 	}
 
 	def sceneCount = roomScenes.size()
-  def currentSceneIndex = (state.sceneIndex[switchId] != null) ? state.sceneIndex[switchId] : -1
-	def sceneActivated = false
+	def currentSceneIndex = (state.sceneIndex[switchId] != null) ? state.sceneIndex[switchId] : -1 
+	def newIndex
+
+	if (direction == "next") {
+		newIndex = (currentSceneIndex + 1) % sceneCount
+	} else if (direction == "previous") {
+		newIndex = (currentSceneIndex - 1 + sceneCount) % sceneCount
+	} else {
+		log.warn "cycleScene: Invalid direction '${direction}'. Defaulting to 'next'."
+		newIndex = (currentSceneIndex + 1) % sceneCount
+	}
+
+	activateScene(roomScenes[newIndex])
+	state.sceneIndex[switchId] = newIndex
+	log.info "cycleScene: Activated scene '${roomScenes[newIndex]?.displayName}' (index ${newIndex}, direction ${direction}) for ${triggeringSwitch.displayName}"
+	return true
+}
+
+private void handleSceneModeAction(triggeringSwitch, buttonNumber, buttonEvent) {
+	def switchId = triggeringSwitch.id.toString()
+	boolean sceneActionTaken = false 
 
 	if (buttonNumber == 1 && buttonEvent == "pushed") {
-		currentSceneIndex = (currentSceneIndex + 1) % sceneCount
-		activateScene(roomScenes[currentSceneIndex])
-		state.sceneIndex[switchId] = currentSceneIndex
-		sceneActivated = true
+		sceneActionTaken = cycleScene(triggeringSwitch, "next")
 	} else if (buttonNumber == 1 && buttonEvent == "held") {
-		currentSceneIndex = (currentSceneIndex - 1 + sceneCount) % sceneCount
-		activateScene(roomScenes[currentSceneIndex])
-		state.sceneIndex[switchId] = currentSceneIndex
-		sceneActivated = true
-	} else if (!(buttonNumber == 1 && buttonEvent == "released")) { // Any other button event exits scene mode
+		sceneActionTaken = cycleScene(triggeringSwitch, "previous")
+	} else if (!(buttonNumber == 1 && buttonEvent == "released")) { 
 		 exitSceneMode([switchId: switchId])
 	}
 
-	if (sceneActivated) {
-		log.info "Scene Mode: Activated scene '${roomScenes[currentSceneIndex]?.displayName}' (index ${currentSceneIndex}) for ${triggeringSwitch.displayName}"
+	if (sceneActionTaken) {
 		scheduleSceneModeTimeout(triggeringSwitch)
 	}
 }
@@ -886,10 +1012,9 @@ private void handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent)
 	if (isSceneOnlySwitch(switchId)) {
 		log.info "${triggeringSwitch.displayName} is a scene-only switch."
 		if (buttonNumber == (settings.singleTapUpButtonNumber as Integer) && buttonEvent == settings.singleTapUpButtonEvent) {
-			handleSceneOnlyCycle(triggeringSwitch)
+			cycleScene(triggeringSwitch, "next") 
 		} else if (buttonNumber == (settings.singleTapDownButtonNumber as Integer) && buttonEvent == settings.singleTapDownButtonEvent) {
-			 // For scene-only switch, "down" typically means turn associated zone/room off.
-			 handleZoneOff(triggeringSwitch) // Or a specific "scene off" if defined. For now, using ZoneOff.
+			 handleSceneOnlyOff(triggeringSwitch)
 		}
 		return
 	}
@@ -920,31 +1045,66 @@ private void handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent)
 }
 
 private void handleAreaOn(triggeringSwitch, areaLights) {
-	if (areaLights && !areaLights.isEmpty()) {
-		Map targetSettings = getTargetSettingsForMode()
-		def targetLevel = targetSettings.level
-		def targetCt = targetSettings.ct
-		def shouldSetCt = targetSettings.enableCt
-		log.info "handleAreaOn for ${triggeringSwitch.displayName}: Turning ON ${areaLights.size()} area light(s). Level: ${targetLevel}%, CT: ${targetCt}K (Set CT: ${shouldSetCt})"
+	if (!areaLights || areaLights.isEmpty()) {
+		log.warn "No area lights for ${triggeringSwitch.displayName}. Area On skipped."
+		return
+	}
 
+	Map effectiveTargetSettings
+	String modeUsedForSettings = location.currentMode?.name ?: "current (unknown)"
 
-		areaLights.each { light ->
-			try {
-				boolean powerCommandSent = false
-				if (light.hasCapability("SwitchLevel")) {
-					light.setLevel(targetLevel); powerCommandSent = true
-				} else if (light.hasCommand("on")) {
-					light.on(); powerCommandSent = true
-				}
-				if (powerCommandSent && shouldSetCt && light.hasCapability("ColorTemperature")) {
-					light.setColorTemperature(targetCt)
-				}
-			} catch (e) { log.error "Error controlling light ${light.displayName} in handleAreaOn: ${e.message}"}
+	def firstLight = areaLights.first()
+	boolean useDayModeOverride = false
+
+	if (firstLight?.currentValue('switch') == 'on') {
+		log.debug "First light ${firstLight.displayName} is ON. Checking for Day mode override."
+		Map currentModeSettings = getModeSettings() // Settings for the actual current mode
+
+		Integer currentLightLevel = null
+		if (firstLight.hasAttribute('level') && firstLight.currentValue('level') != null) {
+			currentLightLevel = firstLight.currentValue('level') as Integer
+		}
+		
+		boolean levelMatches = (currentLightLevel == null && currentModeSettings.level == null) ||
+								 (currentLightLevel != null && currentLightLevel == currentModeSettings.level)
+		// CT Matching for Day mode override is removed as per original code logic.
+		// The original code only checks levelMatches for this override.
+
+		if (levelMatches) {
+			log.info "First light ${firstLight.displayName} matches current mode's level. Overriding with Day mode settings."
+			effectiveTargetSettings = getModeSettings("Day") // Use new getModeSettings
+			modeUsedForSettings = "Day (override)"
+			useDayModeOverride = true
+		} else {
+			log.debug "First light ${firstLight.displayName} does not match current mode's level (Level: ${currentLightLevel} vs ${currentModeSettings.level}). Using current mode."
+			effectiveTargetSettings = currentModeSettings
 		}
 	} else {
-		log.warn "No area lights for ${triggeringSwitch.displayName}. Area On skipped."
+		log.debug "First light ${firstLight.displayName} is OFF or not found. Using current mode settings."
+		effectiveTargetSettings = getModeSettings() // Use new getModeSettings
+	}
+
+	def targetLevel = effectiveTargetSettings.level
+	def targetCt = effectiveTargetSettings.ct 
+	def shouldSetCt = effectiveTargetSettings.enableCt
+
+	log.info "handleAreaOn for ${triggeringSwitch.displayName} (using ${modeUsedForSettings} settings): Turning ON ${areaLights.size()} area light(s). Level: ${targetLevel}%, CT: ${targetCt}K (Set CT: ${shouldSetCt})"
+
+	areaLights.each { light ->
+		try {
+			boolean powerCommandSent = false
+			if (light.hasCapability("SwitchLevel")) {
+				light.setLevel(targetLevel); powerCommandSent = true
+			} else if (light.hasCommand("on")) {
+				light.on(); powerCommandSent = true
+			}
+			if (powerCommandSent && shouldSetCt && light.hasCapability("ColorTemperature") && targetCt != null) {
+				light.setColorTemperature(targetCt)
+			}
+		} catch (e) { log.error "Error controlling light ${light.displayName} in handleAreaOn: ${e.message}"}
 	}
 }
+
 
 private void handleZoneOn(triggeringSwitch) {
 	def switchId = triggeringSwitch.id.toString()
@@ -955,7 +1115,7 @@ private void handleZoneOn(triggeringSwitch) {
 		return
 	}
 
-	Map targetSettings = getTargetSettingsForMode()
+	Map targetSettings = getModeSettings() // Zone On always uses current mode (via new getModeSettings)
 	def targetLevel = targetSettings.level
 	def targetCt = targetSettings.ct
 	def shouldSetCt = targetSettings.enableCt
@@ -990,7 +1150,7 @@ private void handleZoneOn(triggeringSwitch) {
 				} else if (light.hasCommand("on")) {
 					 light.on(); powerCommandSent = true
 				}
-				if (powerCommandSent && shouldSetCt && light.hasCapability("ColorTemperature")) {
+				if (powerCommandSent && shouldSetCt && light.hasCapability("ColorTemperature") && targetCt != null) {
 					light.setColorTemperature(targetCt)
 				}
 			} catch (e) { log.error "Error in Zone/Room On for light ${light.displayName}: ${e.message}" }
@@ -1001,53 +1161,60 @@ private void handleZoneOn(triggeringSwitch) {
 }
 
 private void handleAreaOff(triggeringSwitch, areaLights) {
- if (areaLights && !areaLights.isEmpty()) {
-		log.info "handleAreaOff for ${triggeringSwitch.displayName}: Turning OFF ${areaLights.size()} area light(s)."
-		 areaLights.each { light ->
-			try { if (light.hasCommand("off")) light.off() }
-			catch (e) { log.error "Error turning light OFF for ${light.displayName}: ${e.message}"}
-		 }
- } else {
-		log.warn "No area lights for ${triggeringSwitch.displayName}. Area Off skipped."
- }
+	if (areaLights && !areaLights.isEmpty()) {
+			log.info "handleAreaOff for ${triggeringSwitch.displayName}: Turning OFF ${areaLights.size()} area light(s)."
+			 areaLights.each { light ->
+				try { if (light.hasCommand("off")) light.off() }
+				catch (e) { log.error "Error turning light OFF for ${light.displayName}: ${e.message}"}
+			 }
+	} else {
+			log.warn "No area lights for ${triggeringSwitch.displayName}. Area Off skipped."
+	}
 }
 
-private void handleSceneOnlyCycle(triggeringSwitch) {
+private void handleSceneOnlyOff(triggeringSwitch) {
 	def switchId = triggeringSwitch.id.toString()
-	def sortedSceneIds = state.sortedSwitchSceneIds[switchId]
-	if (!sortedSceneIds || sortedSceneIds.isEmpty()) {
-		log.warn "handleSceneOnlyCycle: No sorted scenes for ${triggeringSwitch.displayName}."
-		return
+	log.info "Scene-only switch ${triggeringSwitch.displayName} tap down: attempting to turn off lights."
+
+	List<String> roomLightIds = state.switchRoomLights[switchId] ?: []
+	def roomLights = roomLightIds.isEmpty() ? [] : getDevicesById(roomLightIds, settings.controlledLightsAndScenes)
+
+	if (roomLights && !roomLights.isEmpty()) {
+		log.info "Turning off ${roomLights.size()} room lights for ${triggeringSwitch.displayName} (scene-only tap down)."
+		roomLights.each { light ->
+			try { if (light.hasCommand("off")) light.off() }
+			catch (e) { log.error "Error turning off room light ${light.displayName}: ${e.message}"}
+		}
+	} else {
+		log.info "No room lights found for ${triggeringSwitch.displayName} (scene-only tap down). Checking zone lights."
+		List<String> zoneLightIds = state.switchZoneLights[switchId] ?: []
+		def zoneLights = zoneLightIds.isEmpty() ? [] : getDevicesById(zoneLightIds, settings.controlledLightsAndScenes)
+
+		if (zoneLights && !zoneLights.isEmpty()) {
+			log.info "Turning off ${zoneLights.size()} zone lights for ${triggeringSwitch.displayName} (scene-only tap down)."
+			zoneLights.each { light ->
+				try { if (light.hasCommand("off")) light.off() }
+				catch (e) { log.error "Error turning off zone light ${light.displayName}: ${e.message}"}
+			}
+		} else {
+			log.warn "No room or zone lights found to turn off for scene-only switch ${triggeringSwitch.displayName}."
+		}
 	}
-
-	def roomScenes = getDevicesById(sortedSceneIds, settings.controlledLightsAndScenes)
-	if (!roomScenes || roomScenes.empty) {
-		log.warn "handleSceneOnlyCycle: Could not retrieve scene devices for ${triggeringSwitch.displayName} using sorted IDs."
-		return
-	}
-
-	def sceneCount = roomScenes.size()
-	def currentSceneIndex = state.sceneIndex[switchId] ?: -1
-	def nextIndex = (currentSceneIndex + 1) % sceneCount
-
-	activateScene(roomScenes[nextIndex])
-	state.sceneIndex[switchId] = nextIndex
-	log.info "SceneOnlyCycle: Activated scene '${roomScenes[nextIndex]?.displayName}' (index ${nextIndex}) for scene-only switch ${triggeringSwitch.displayName}"
 }
+
 
 private void handleDimStart(triggeringSwitch, dimmableAreaLights, String direction) {
 	if (!dimmableAreaLights || dimmableAreaLights.isEmpty()) {
-		// log.debug "handleDimStart: No dimmable area lights for ${triggeringSwitch.displayName}. Skipping." // Not a major event for info log
 		return
 	}
 	log.info "handleDimStart for ${triggeringSwitch.displayName}: Start level change '${direction}' for ${dimmableAreaLights.size()} dimmable light(s)."
 
 	if (direction == "up" && dimmableAreaLights.first()?.currentValue('switch') == 'off') {
 		dimmableAreaLights.each { light ->
-			try { if (light.hasCommand('setLevel')) light.setLevel(2) }
+			try { if (light.hasCommand('setLevel')) light.setLevel(2) } 
 			catch (e) { log.error "Error setting min level on ${light.displayName}: ${e.message}" }
 		}
-		pause(250)
+		pause(250) 
 	}
 
 	dimmableAreaLights.each { light ->
@@ -1057,13 +1224,13 @@ private void handleDimStart(triggeringSwitch, dimmableAreaLights, String directi
 }
 
 private void handleDimStop(triggeringSwitch, dimmableAreaLights) {
- if (dimmableAreaLights && !dimmableAreaLights.isEmpty()) {
-		log.info "handleDimStop for ${triggeringSwitch.displayName}: Stop level change for ${dimmableAreaLights.size()} dimmable light(s)."
-		dimmableAreaLights.each { light ->
-			try { if(light.hasCommand('stopLevelChange')) light.stopLevelChange() }
-			catch (e) { log.error "Error calling stopLevelChange() on ${light.displayName}: ${e.message}"}
-		}
- } // else { log.debug "handleDimStop: No dimmable area lights for ${triggeringSwitch.displayName}. Skipping." } // Not a major event
+	if (dimmableAreaLights && !dimmableAreaLights.isEmpty()) {
+			log.info "handleDimStop for ${triggeringSwitch.displayName}: Stop level change for ${dimmableAreaLights.size()} dimmable light(s)."
+			dimmableAreaLights.each { light ->
+				try { if(light.hasCommand('stopLevelChange')) light.stopLevelChange() }
+				catch (e) { log.error "Error calling stopLevelChange() on ${light.displayName}: ${e.message}"}
+			}
+	}
 }
 
 private void handleZoneOff(triggeringSwitch) {
@@ -1119,7 +1286,7 @@ def activateScene(sceneDevice) {
 	log.info "activateScene: Activating scene '${sceneDevice.displayName}'."
 	try {
 		if (sceneDevice.hasCommand("on")) sceneDevice.on()
-		else if (sceneDevice.hasCommand("push")) sceneDevice.push(1)
+		else if (sceneDevice.hasCommand("push")) sceneDevice.push(1) 
 		else log.warn "Scene ${sceneDevice.displayName} supports neither 'on()' nor 'push()'."
 	} catch (e) {
 		log.error "Failed to activate scene ${sceneDevice.displayName}: ${e.message}."
@@ -1131,7 +1298,7 @@ def scheduleSceneModeTimeout(triggeringSwitch) {
 	def timeoutSeconds = (timeoutSetting != null && timeoutSetting instanceof Number && timeoutSetting > 0) ? timeoutSetting : 7
 	def switchId = triggeringSwitch.id.toString()
 
-	cancelSceneModeTimeout(triggeringSwitch)
+	cancelSceneModeTimeout(triggeringSwitch) 
 	state.sceneTimeoutJob[switchId] = runIn(timeoutSeconds, "exitSceneMode", [data: [switchId: switchId], overwrite: true])
 }
 
@@ -1157,7 +1324,7 @@ def exitSceneMode(data) {
 				 state.sceneMode[id] = false
 				 def sw = getDevicesById(id, settings.controlledSwitches)
 				 if (sw) {
-					 setLedEffect(sw, "solid")
+					 setLedEffect(sw, "solid") 
 					 log.info "Exited scene mode for ${sw.displayName} (cleared due to global exit)."
 				 }
 			}
@@ -1169,13 +1336,13 @@ def exitSceneMode(data) {
 	if (triggeringSwitch) {
 		if (state.sceneMode[switchId]) {
 			state.sceneMode[switchId] = false
-			setLedEffect(triggeringSwitch, "solid")
+			setLedEffect(triggeringSwitch, "solid") 
 			log.info "Exited scene mode for ${triggeringSwitch.displayName}"
 		}
 	} else {
 		log.warn "exitSceneMode: Switch with ID ${switchId} not found. Clearing its scene mode state."
 		state.sceneMode?.remove(switchId)
-		state.sceneIndex?.remove(switchId)
+		state.sceneIndex?.remove(switchId) 
 	}
 	if (state.sceneTimeoutJob[switchId]) {
 		try { unschedule(state.sceneTimeoutJob[switchId]) } catch(e){}
@@ -1187,38 +1354,57 @@ def setLedEffect(switchDevice, effectName) {
 	if (!switchDevice || !switchDevice.hasCommand('ledEffectAll')) return
 	try {
 		Integer hue
-		String effectiveHueString = (switchDevice.getSetting('parameter95')?.toString() ?: '170')
+		String effectiveHueString = (switchDevice.getSetting('parameter95')?.toString() ?: '170') 
 		try {
 			hue = effectiveHueString.toInteger()
 		} catch (NumberFormatException e) {
 			log.warn "Could not parse effective hue string '${effectiveHueString}' (derived from device setting 'parameter95') for LED hue on ${switchDevice.displayName}. Using default hue 170."
-			hue = 170
+			hue = 170 
 		}
 
-		Integer effectCode = (effectName == "chase") ? 17 : 255 // 17 = Chase, 255 = Solid (or whatever the "normal" is)
-		switchDevice.ledEffectAll(effectCode, hue, 100, 255) // Assuming level 100, duration 255 (forever for solid)
+		Integer effectCode = (effectName == "chase") ? 17 : 255 
+		switchDevice.ledEffectAll(effectCode, hue, 100, 255) 
 	} catch (e) {
 		 log.error "Failed to send LED effect to ${switchDevice.displayName}: ${e.message}."
 	}
 }
 
-Map getTargetSettingsForMode() {
-	def currentModeName = location.currentMode?.name?.toString()?.trim()
-	Map modeConfig = state.modeSettingsMap[currentModeName]
+// Combined function to get settings for a specific mode or the current mode
+private Map getModeSettings(String targetModeName = null) {
+	String effectiveModeName = targetModeName ?: location.currentMode?.name?.toString()?.trim()
+	boolean specificModeRequested = targetModeName != null && !targetModeName.isEmpty()
 
-	Integer finalLevel = state.globalDefaultLevel
-	Integer finalCt = state.globalDefaultColorTemperature
-	Boolean applyCt = false // Default to not applying CT unless explicitly enabled for the mode
+	Map modeConfig = state.modeSettingsMap[effectiveModeName]
+
+	Integer finalLevel = state.globalDefaultLevel // Guaranteed non-null by buildModeSettingsMap
+	Integer finalCt = state.globalDefaultColorTemperature // Guaranteed non-null
+	Boolean resolvedEnableCt
 
 	if (modeConfig) {
-		finalLevel = modeConfig.level ?: state.globalDefaultLevel // Use mode level or global default
-		if (modeConfig.enableCt) { // Check if CT should be set for this mode
-			applyCt = true
-			finalCt = modeConfig.ct ?: state.globalDefaultColorTemperature // Use mode CT or global default CT
+		finalLevel = modeConfig.level ?: state.globalDefaultLevel
+		resolvedEnableCt = modeConfig.enableCt // Guaranteed boolean by buildModeSettingsMap
+		if (resolvedEnableCt) {
+			finalCt = modeConfig.ct ?: state.globalDefaultColorTemperature
+		}
+		// log.debug "getModeSettings: Found settings for '${effectiveModeName}'. Level=${finalLevel}, CT=${finalCt}, EnableCT=${resolvedEnableCt}"
+	} else {
+		// Mode not found in map. Global defaults for level and CT are already set.
+		if (specificModeRequested) {
+			log.warn "getModeSettings: Settings for specifically requested mode '${effectiveModeName}' not found in map. Using global defaults and forcing enableCt=true for this explicit request."
+			resolvedEnableCt = true // As per original getTargetSettingsForSpecificMode behavior
+		} else { // Current mode not found in map
+			// log.debug "getModeSettings: Settings for current mode '${effectiveModeName}' not found in map. Using global defaults. 'enableCt' will be false as per original getModeSettings behavior for missing current mode config."
+			resolvedEnableCt = false // As per original getModeSettings behavior for current mode without config
 		}
 	}
-	// log.debug "getTargetSettingsForMode: Mode='${currentModeName}', Level=${finalLevel}, CT=${finalCt}, ApplyCT=${applyCt}"
-	return [level: finalLevel, ct: finalCt, enableCt: applyCt]
+	
+	// Ensure finalCt has a value if resolvedEnableCt is true
+	if (resolvedEnableCt && finalCt == null) { // Should not happen if globalDefaultColorTemperature is set
+		finalCt = state.globalDefaultColorTemperature 
+	}
+
+	// log.trace "getModeSettings for '${effectiveModeName}' (Specific Req: ${specificModeRequested}): Level=${finalLevel}, CT=${finalCt}, EnableCT=${resolvedEnableCt}"
+	return [level: finalLevel, ct: finalCt, enableCt: resolvedEnableCt]
 }
 
 private boolean isSceneOnlySwitch(String switchId) {
@@ -1229,41 +1415,38 @@ private boolean isSceneOnlySwitch(String switchId) {
 
 def isScene(device) {
 	if (!device) return false
-	// Check display name for "scene" (case-insensitive)
 	if (device.displayName instanceof String && device.displayName.matches(/(?i).*\b[Ss][Cc][Ee][Nn][Ee]\b.*/)) return true
-	// Check specific device type names known to be scenes
-	def deviceType = device.typeName // Get the device's type name
+	def deviceType = device.typeName
 	if (deviceType && ["CoCoHue Scene", "Scene Activator", "hueBridgeScene", "Virtual Scene Switch"].contains(deviceType)) return true
+	try {
+		if (device.hasCapability("SceneActivation")) return true
+	} catch (MissingMethodException e) { /* ignore */ }
 	return false
 }
 
-// Optimized getDevicesById using pre-built index maps
 def getDevicesById(def deviceIdInput, Collection deviceListParameter) {
 	boolean singleIdMode = deviceIdInput instanceof String
 	
-	// Handle empty or null input immediately
 	if (!deviceIdInput || (deviceIdInput instanceof Collection && deviceIdInput.isEmpty())) {
 		return singleIdMode ? null : []
 	}
-	if (!deviceListParameter) { // Should not happen if called with settings.controlledSwitches/Lights
+	if (!deviceListParameter) {
 		log.warn "getDevicesById: deviceListParameter is null. Cannot retrieve devices."
 		return singleIdMode ? null : []
 	}
 
 	List<String> idsToFetch
 	if (singleIdMode) {
-		idsToFetch = [deviceIdInput.toString()] // Ensure it's a string for map lookup
+		idsToFetch = [deviceIdInput.toString()]
 	} else if (deviceIdInput instanceof Collection) {
-		// Ensure all elements are strings and filter out any nulls from the input collection
 		idsToFetch = deviceIdInput.collect { it?.toString() }.findAll { it != null }
-	} else { // Fallback for unexpected single input type, treat as single ID
+	} else { 
 		idsToFetch = [deviceIdInput.toString()]
 	}
 
 	if (idsToFetch.isEmpty()) return singleIdMode ? null : []
 
 	Map<String, Integer> indexMapForList
-	// Determine which index map to use based on object identity of the list parameter
 	if (settings.controlledSwitches.is(deviceListParameter)) {
 		indexMapForList = state.deviceToIndexMap?.switches
 	} else if (settings.controlledLightsAndScenes.is(deviceListParameter)) {
@@ -1280,33 +1463,34 @@ def getDevicesById(def deviceIdInput, Collection deviceListParameter) {
 
 	if (indexMapForList == null) {
 		log.error "getDevicesById: Index map is null for the provided device list type. This indicates an issue with state.deviceToIndexMap initialization."
-		return singleIdMode ? null : [] // Cannot proceed without an index
+		return singleIdMode ? null : [] 
 	}
 
 	List foundDevices = []
 	idsToFetch.each { id ->
 		Integer deviceIndex = indexMapForList[id]
 		if (deviceIndex != null && deviceIndex >= 0 && deviceIndex < deviceListParameter.size()) {
-			// Fast path: direct access using pre-calculated index
 			def device = deviceListParameter[deviceIndex]
-			// Verify the device at the index actually matches the ID (paranoid check for list mutations)
-			if (device?.id?.toString() == id) { // Check ID to ensure index is still valid
+			// Additional check to ensure the device at the index actually matches the ID, in case of list changes not reflected in index
+			if (device?.id?.toString() == id) { 
 				foundDevices << device
 			} else {
 				log.warn "getDevicesById: Stale or incorrect index for ID ${id}. Device at index ${deviceIndex} is ${device?.id} ('${device?.displayName}'). Searching list as fallback for this ID."
-				def fallbackDevice = deviceListParameter.find { it.id?.toString() == id } // Fallback search
+				def fallbackDevice = deviceListParameter.find { it.id?.toString() == id } 
 				if (fallbackDevice) foundDevices << fallbackDevice
 			}
-		} else if (deviceIndex != null) { // Index exists but is out of bounds
+		} else if (deviceIndex != null) { 
 			 log.warn "getDevicesById: Index ${deviceIndex} for ID ${id} is out of bounds for list size ${deviceListParameter.size()}. Searching list as fallback for this ID."
-			 def fallbackDevice = deviceListParameter.find { it.id?.toString() == id } // Fallback search
+			 def fallbackDevice = deviceListParameter.find { it.id?.toString() == id } 
 			 if (fallbackDevice) foundDevices << fallbackDevice
-		} else { // ID not found in the index map, try a direct search as a last resort
-			// log.debug "getDevicesById: ID ${id} not found in index map. Searching list as fallback." // This can be noisy if expected for some IDs
-			def fallbackDevice = deviceListParameter.find { it.id?.toString() == id } // Fallback search
+		} else { 
+			// log.trace "getDevicesById: ID ${id} not in index. Searching list as fallback." // Can be noisy
+			def fallbackDevice = deviceListParameter.find { it.id?.toString() == id } 
 			if (fallbackDevice) {
 				foundDevices << fallbackDevice
-			} // else: device truly not in list
+			} else {
+				// log.warn "getDevicesById: ID ${id} not found in index or by searching the list." // Only log if truly not found
+			}
 		}
 	}
 	return singleIdMode ? (foundDevices.isEmpty() ? null : foundDevices.first()) : foundDevices
@@ -1317,32 +1501,26 @@ def updateSwitchControlSummary() {
 		state.switchControlSummary = "No switches are currently selected for control."
 		return
 	}
-	// Check for incomplete initialization which could lead to errors here
 	if (state.switchAreaLights == null || state.switchIdToLocationMap == null ||
 		state.switchScenes == null || state.switchZoneLights == null || state.switchRoomLights == null ||
-		state.deviceToIndexMap == null || state.sortedSwitchSceneIds == null || state.switchDimmableAreaLightIds == null) { // Added checks from your original code
+		state.deviceToIndexMap == null || state.sortedSwitchSceneIds == null || state.switchDimmableAreaLightIds == null) {
 		state.switchControlSummary = "Device maps are not fully initialized. Please save settings again."
-		// log.warn "updateSwitchControlSummary: Aborting due to uninitialized state maps." // Optional: log this state
 		return
 	}
 
 	StringBuilder summary = new StringBuilder()
-
-	// Sort switches by display name for consistent summary order
 	settings.controlledSwitches.sort { it.displayName ?: '' }.each { sw ->
 		def switchId = sw.id.toString()
 		def switchName = sw.displayName ?: "Switch ID ${switchId}"
 		def switchLocation = state.switchIdToLocationMap[switchId]
-		// Safely get room name for stripping, ensure it's trimmed
 		String currentSwitchRoomNameTrimmed = switchLocation?.roomName?.trim()
 
-		// Helper to transform device names, stripping the room if present
 		def transformName = { String deviceDisplayNameString, String roomNameToStrip ->
 			def dn = deviceDisplayNameString?.trim()
-			if (!dn) return "" // Handle null or empty display names
+			if (!dn) return "" 
 			if (roomNameToStrip && dn.toLowerCase().startsWith((roomNameToStrip + " ").toLowerCase())) {
 				def stripped = dn.substring(roomNameToStrip.length() + 1).trim()
-				return stripped ?: dn // Return stripped name, or original if stripping results in empty
+				return stripped ?: dn 
 			}
 			return dn
 		}
@@ -1350,35 +1528,29 @@ def updateSwitchControlSummary() {
 		summary.append("${switchName.toUpperCase()}\n")
 		boolean isThisSwitchSceneOnly = isSceneOnlySwitch(switchId)
 
-		// Tap Up: Area Lights or Cycle Scenes (for scene-only switches)
 		List<String> idsForTapUp = isThisSwitchSceneOnly ? state.sortedSwitchSceneIds[switchId] : state.switchAreaLights[switchId]
 		String tapUpHeader = isThisSwitchSceneOnly ? "Tap Up (Cycle Scenes)" : "Tap Up (Area Lights)"
 		String tapUpDeviceNames = getDevicesById(idsForTapUp, settings.controlledLightsAndScenes)
-			?.sort { it.displayName ?: '' }// Sort devices by name
+			?.sort { it.displayName ?: '' }
 			?.collect { dev -> transformName(dev.displayName, currentSwitchRoomNameTrimmed) }
 			?.join(", ")
 		summary.append(" ${tapUpHeader}: ${ (idsForTapUp && !idsForTapUp.isEmpty() && tapUpDeviceNames) ? tapUpDeviceNames : "None" }\n")
 
-		// Tap Up 2x: Zone/Room Lights (consistent for all switch types for this action)
 		String tapUp2xHeader = "Tap Up 2x"
-		// Determine lights for 2x tap: Zone lights if zone exists, otherwise Room lights
 		List<String> idsForTapUp2x = (switchLocation?.zoneName ? state.switchZoneLights[switchId] : state.switchRoomLights[switchId]) ?: []
 		String tapUp2xDeviceNames = getDevicesById(idsForTapUp2x, settings.controlledLightsAndScenes)
-			?.sort { it.displayName ?: '' }// Sort devices by name
+			?.sort { it.displayName ?: '' }
 			?.collect { dev -> transformName(dev.displayName, currentSwitchRoomNameTrimmed) }
 			?.join(", ")
 		summary.append(" ${tapUp2xHeader}: ${ (idsForTapUp2x && !idsForTapUp2x.isEmpty() && tapUp2xDeviceNames) ? tapUp2xDeviceNames : "None" }\n")
 
-		// Config Button: Scenes (primary or zone fallback)
-		List<String> idsForScenes = state.sortedSwitchSceneIds[switchId] // This now includes zone fallback if applicable
+		List<String> idsForScenes = state.sortedSwitchSceneIds[switchId] 
 		String sceneDeviceNames = getDevicesById(idsForScenes, settings.controlledLightsAndScenes)
-			// No need to sort here if sortedSwitchSceneIds is already sorted, but collecting names might reorder if not careful
-			// Assuming getDevicesById preserves order or scenes are re-sorted if needed for display
-			?.collect { dev -> transformName(dev.displayName, currentSwitchRoomNameTrimmed) } // Apply name transformation
+			?.collect { dev -> transformName(dev.displayName, currentSwitchRoomNameTrimmed) } 
 			?.join(", ")
 		summary.append(" Scenes: ${ (idsForScenes && !idsForScenes.isEmpty() && sceneDeviceNames) ? sceneDeviceNames : "None" }\n")
 		
-		summary.append("\n") // Add a blank line between switches
+		summary.append("\n") 
 	}
 
 	state.switchControlSummary = summary.toString().trim()
