@@ -28,17 +28,25 @@ Switch Bot analyzes the display names of the devices you select to build its int
 
 ## Device Naming Example
 
-Here is an example of how you might setup a room with device names:
+Here is an example of how you might set up rooms with device names:
 
-- Kitchen Switch
-- Kitchen Island Switch
-- Kitchen Island 1
-- Kitchen Island 2
+- Kitchen All Switch
 - Kitchen Ceiling
 - Kitchen Toaster
 - Kitchen Scene 1: Cooking
 - Kitchen Scene 2: Eating
 - Kitchen Scene 3: Party
+- Kitchen Island Switch
+- Kitchen Island 1
+- Kitchen Island 2
+
+- Living Room Switch
+- Living Room Ceiling [Living Area]
+- Living Room Lamp [Living Area]
+
+- Dining Room Switch
+- Dining Room Scene 1: Normal [Living Area]
+- Dining Room Scene 2: Party [Living Area]
 
 ## Usage (Default Button Mappings)
 
