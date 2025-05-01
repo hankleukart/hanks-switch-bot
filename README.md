@@ -31,11 +31,11 @@ Switch Bot analyzes the display names of the devices you select to build its int
 Here is an example of how you might set up rooms with device names:
 
 - Kitchen All Switch
+	- Kitchen Ceiling
+	- Kitchen Toaster
 	- Kitchen Island Switch
 		- Kitchen Island 1
 		- Kitchen Island 2
-	- Kitchen Ceiling
-	- Kitchen Toaster
 	- Kitchen Scene 1: Cooking
 	- Kitchen Scene 2: Eating
 	- Kitchen Scene 3: Party
