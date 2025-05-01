@@ -51,16 +51,16 @@ Here is an example of how you might set up rooms with device names:
 By default, Hank's Switch Bot uses these mappings pre-defined for Inovelli switches (configurable in Advanced settings):
 
 - **Tap Up:**
-	- **Normal Mode:** Lights on and set to current mode's brightness level and color temperature. If already in that state, Tap Up sets to the default mode's brightness level. For scene-only switches (switches mapped to scenes but no lights), Tap Up cycles to the next scene, even outside scene mode.
+	- **Normal Mode:** Lights on and set to *current* mode's brightness level and color temperature. If already in that state, Tap Up sets to the *default* mode's brightness level. For scene-only switches (switches mapped to scenes but no lights), Tap Up cycles to the next scene, even outside scene mode.
 	- **Scene Mode:** Cycle forward to the next scene.
 - **Tap Down:**
-	- **Normal Mode:** Lights off.
+	- **Normal Mode:** Lights off. For scene-only switches, turns off any lights with matching *room* stem, or otherwise, turns off *zone* lights.
 	- **Scene Mode:** Cycle backward to the previous scene.
-- **Tap Up 2x:** Zone/Room Lights ON (to mode default level/CT).
-- **Tap Down 2x:** Zone/Room Lights OFF.
+- **Tap Up 2x:** Zone or room lights on and set to *current* mode's level and CT.
+- **Tap Down 2x:** Zone or room lights off.
 - **Hold Up:** Dim up.
 - **Hold Down:** Dim down.
-- **Config Button:** Toggle Scene Mode On/Off for that switch. On Inovelli switches, the LED bar will chase to indicate Scene Mode. Scene Mode automatically exits after a period of inactivity (default 7 seconds, configurable).
+- **Config Button:** Toggle Scene Mode on/off for that switch. On Inovelli switches, the LED bar will chase to indicate Scene Mode. Scene Mode automatically exits after a period of inactivity (default 7 seconds, configurable).
 
 ## Installation
 
