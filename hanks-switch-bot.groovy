@@ -1,5 +1,5 @@
 /**
-* Hank's Switch Bot v05-09-2025
+* Hank's Switch Bot v05-10-2025
 * Copyright 2025 Hank Leukart
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -28,7 +28,7 @@ definition(
 
 preferences {
 	section("<h1>Hank's Switch Bot</h1>") {
-		paragraph "Switch Bot automatically creates zero-configuration control of light and scenes with switches based on device names. For example, \"Kitchen Ceiling Switch\" will automatically control lights named \"Kitchen Ceiling 1 & 2\" and a scene named \"Kitchen Scene: Cooking.\" A switch named \"Kitchen Switch\" will control all \"Kitchen\" lights not controlled by another switch. Switches named with \"Local Switch\" or ending in \"(S)\" will only have their LEDs updated based on mode. Simply select all switches, lights, and scenes you want Switch Bot to handle for you.<hr />"
+		paragraph "Switch Bot automatically creates zero-configuration control of light and scenes with switches based on device names. For example, \"Kitchen Ceiling Switch\" will automatically control lights named \"Kitchen Ceiling 1 & 2\" and a scene named \"Kitchen Scene: Cooking.\" A switch named \"Kitchen Switch\" will control all \"Kitchen\" lights not controlled by another switch. Simply select all switches, lights, and scenes you want Switch Bot to handle for you.<hr />"
 
 		input "controlledSwitches", "capability.pushableButton",
 			title: "Switches controlled by Switch Bot:",
@@ -101,34 +101,26 @@ preferences {
 	}
 
 	section("Advanced Button Mappings (Optional)", hideable: true, hidden: true) {
-		 input "singleTapUpButtonNumber", "number", title: "Single Tap Up (Area ON / Next Scene) Button Number", defaultValue: 1, required: false, width: 2
-		 input "singleTapUpButtonEvent", "enum", title: "Single Tap Up (Area ON / Next Scene) Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
-		 paragraph "", width: 12
-		 input "singleTapDownButtonNumber", "number", title: "Single Tap Down (Area/Room/Zone OFF) Button Number", defaultValue: 1, required: false, width: 2
-		 input "singleTapDownButtonEvent", "enum", title: "Single Tap Down (Area/Room/Zone OFF) Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 2
-		 paragraph "Note: In Scene Mode, Button 1 Pushed/Held are used for cycling scenes.", width: 12
-		 input "configButtonNumber", "number", title: "Scene Mode Toggle Button Number", defaultValue: 8, required: false, width: 2
-		 input "configButtonEvent", "enum", title: "Scene Mode Toggle Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
-		 paragraph "", width: 12
-		 input "doubleTapUpButtonNumber", "number", title: "Zone/Room On Button Number", defaultValue: 2, required: false, width: 2
-		 input "doubleTapUpButtonEvent", "enum", title: "Zone/Room On Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
-		 paragraph "", width: 12
-		 input "doubleTapDownButtonNumber", "number", title: "Zone/Room Off Button Number", defaultValue: 2, required: false, width: 2
-		 input "doubleTapDownButtonEvent", "enum", title: "Zone/Room Off Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 2
-		 paragraph "", width: 12
-		 input "holdUpButtonNumber", "number", title: "Hold Up (Start Dim Up) Button Number", defaultValue: 6, required: false, width: 2
-		 input "holdUpButtonEvent", "enum", title: "Hold Up (Start Dim Up) Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
-		 paragraph "", width: 12
-		 input "releaseUpButtonNumber", "number", title: "Release Up (Stop Dim Up) Button Number", defaultValue: 7, required: false, width: 2
-		 input "releaseUpButtonEvent", "enum", title: "Release Up (Stop Dim Up) Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
-		 paragraph "", width: 12
-		 input "holdDownButtonNumber", "number", title: "Hold Down (Start Dim Down) Button Number", defaultValue: 6, required: false, width: 2
-		 input "holdDownButtonEvent", "enum", title: "Hold Down (Start Dim Down) Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 2
-		 paragraph "", width: 12
-		 input "releaseDownButtonNumber", "number", title: "Release Down (Stop Dim Down) Button Number", defaultValue: 7, required: false, width: 2
-		 input "releaseDownButtonEvent", "enum", title: "Release Down (Stop Dim Down) Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 2
-		 paragraph "", width: 12
-		 input "sceneModeTimeout", "number", title: "Scene Mode Timeout (seconds)", defaultValue: 7, required: false
+		 input "singleTapUpButtonNumber", "number", title: "On Button Number", defaultValue: 1, required: false, width: 2
+		 input "singleTapUpButtonEvent", "enum", title: "On Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
+		 input "singleTapDownButtonNumber", "number", title: "Off Button Number", defaultValue: 1, required: false, width: 2
+		 input "singleTapDownButtonEvent", "enum", title: "Off Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 2
+		 input "configButtonNumber", "number", title: "Scene Mode Button Number", defaultValue: 8, required: false, width: 2
+		 input "configButtonEvent", "enum", title: "Scene Mode Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
+		 paragraph "Note: In Scene Mode, the on and off buttons are used for navigating scenes.", width: 12
+		 input "doubleTapUpButtonNumber", "number", title: "Room/Zone On Button Number", defaultValue: 2, required: false, width: 3
+		 input "doubleTapUpButtonEvent", "enum", title: "Room/Zone On Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 3
+		 input "doubleTapDownButtonNumber", "number", title: "Room/Zone Off Button Number", defaultValue: 2, required: false, width: 3
+		 input "doubleTapDownButtonEvent", "enum", title: "Room/Zone Off Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 3
+		 input "holdUpButtonNumber", "number", title: "Brighten Start Button Number", defaultValue: 6, required: false, width: 3
+		 input "holdUpButtonEvent", "enum", title: "Brighten Stop Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 3
+		 input "releaseUpButtonNumber", "number", title: "Brighten Stop Button Number", defaultValue: 7, required: false, width: 3
+		 input "releaseUpButtonEvent", "enum", title: "Brighten Stop Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 3
+		 input "holdDownButtonNumber", "number", title: "Dim Start Button Number", defaultValue: 6, required: false, width: 3
+		 input "holdDownButtonEvent", "enum", title: "Dim Start Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 3
+		 input "releaseDownButtonNumber", "number", title: "Dim Stop Button Number", defaultValue: 7, required: false, width: 3
+		 input "releaseDownButtonEvent", "enum", title: "Dim Stop Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 3
+		 input "sceneModeTimeout", "number", title: "Scene Mode Timeout (seconds)", defaultValue: 7, required: false, width: 2
 	}
 }
 
@@ -501,7 +493,7 @@ def buildDeviceMaps() {
 		String type, stem
 		boolean isLocal = false
 
-		if (originalDisplayName.toLowerCase().contains("local switch") || originalDisplayName.toLowerCase().endsWith("(s)")) {
+		if (originalDisplayName.toLowerCase().contains("local switch") || originalDisplayName.toLowerCase().contains("(s)")) {
 			type = "local"; isLocal = true
 			stem = originalDisplayName.toLowerCase().contains("local switch") ?
 				originalDisplayName.substring(0, originalDisplayName.toLowerCase().indexOf("local switch")).trim() :
@@ -1358,7 +1350,7 @@ def updateSwitchControlSummary() {
 		def switchId = sw.id.toString(); def sInfo = state.switchInfoMap[switchId]
 		def switchName = sInfo?.displayName ?: sw.displayName ?: "Switch ID ${switchId}"
 		
-		summary.append("${switchName.toUpperCase()} (${sInfo?.type})\n")
+		summary.append("<b>${switchName.toUpperCase()}</b> (${sInfo?.type})\n")
 
 		def transformName = { String devName, String roomToStrip ->
 			if (!devName) return ""
@@ -1372,30 +1364,30 @@ def updateSwitchControlSummary() {
 
 		// Tap Up (Single)
 		List<String> tapUpIds = isThisSwitchSceneOnly ? (state.sortedSwitchSceneIds[switchId] ?: []) : (state.switchAreaLights[switchId] ?: [])
-		String tapUpHdr = isThisSwitchSceneOnly ? "Tap Up (Next Scene)" : "Tap Up (Area Lights ON)"
+		String tapUpHdr = isThisSwitchSceneOnly ? "On/Next Scene" : "On"
 		String tapUpNames = getDevicesById(tapUpIds, settings.controlledLightsAndScenes)?.sort { it.displayName ?: '' }?.collect { transformName(it.displayName, roomNameForStripping) }?.join(", ")
-		summary.append("  ${tapUpHdr}: ${tapUpNames ?: "None"}\n")
+		summary.append("  <b>${tapUpHdr}</b>: ${tapUpNames ?: "None"}\n")
 
 		// Tap Down (Single)
-		String tapDownHdr = isThisSwitchSceneOnly ? "Tap Down (Room/Zone Lights OFF)" : "Tap Down (Area Lights OFF)"
+		String tapDownHdr = "Off"
 		List<String> tapDownTargetIds = isThisSwitchSceneOnly ? 
 			((sInfo.loc?.roomName ? state.switchRoomLights[switchId] : []) + (sInfo.loc?.zoneName ? state.switchZoneLights[switchId] : [])).unique() :
 			(state.switchAreaLights[switchId] ?: [])
 		String tapDownNames = getDevicesById(tapDownTargetIds, settings.controlledLightsAndScenes)?.sort { it.displayName ?: '' }?.collect { transformName(it.displayName, roomNameForStripping) }?.join(", ")
-		summary.append("  ${tapDownHdr}: ${tapDownNames ?: "None"}\n")
+		summary.append("  <b>${tapDownHdr}</b>: ${tapDownNames ?: "None"}\n")
 
 		// Tap Up 2x (Double) - Zone/Room ON
 		List<String> tapUp2xIds = (sInfo.loc?.zoneName ? state.switchZoneLights[switchId] : sInfo.loc?.roomName ? state.switchRoomLights[switchId] : []) ?: []
 		String tapUp2xNames = getDevicesById(tapUp2xIds, settings.controlledLightsAndScenes)?.sort { it.displayName ?: '' }?.collect { transformName(it.displayName, roomNameForStripping) }?.join(", ")
-		summary.append("  Tap Up 2x (Zone/Room ON): ${tapUp2xNames ?: "None"}\n")
+		summary.append("  <b>On 2x</b>: ${tapUp2xNames ?: "None"}\n")
 		
 		// Tap Down 2x (Double) - Zone/Room OFF
-		summary.append("  Tap Down 2x (Zone/Room OFF): ${tapUp2xNames ?: "None (targets same as Tap Up 2x)"}\n")
+		summary.append("  <b>Off 2x</b>: ${tapUp2xNames ?: "None"}\n")
 
 		// Config Button (Scenes)
 		List<String> sceneIds = state.sortedSwitchSceneIds[switchId] ?: []
 		String sceneNames = getDevicesById(sceneIds, settings.controlledLightsAndScenes)?.collect { transformName(it.displayName, roomNameForStripping) }?.join(", ")
-		summary.append("  Config Btn (Cycle Scenes): ${sceneNames ?: "None"}\n\n")
+		summary.append("  <b>Scene Mode</b>: ${sceneNames ?: "None"}\n\n")
 	}
 	state.switchControlSummary = summary.toString().trim()
 	log.debug("Switch control summary updated.")
