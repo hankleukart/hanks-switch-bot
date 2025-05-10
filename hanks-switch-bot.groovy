@@ -966,7 +966,8 @@ private void handleAreaOn(triggeringSwitch, areaLights) {
 	if (firstLight?.hasAttribute('switch') && firstLight.currentValue('switch') == 'on') {
 		Map currentModeSettings = getModeSettings() 
 		Integer currentLightLevel = firstLight.hasAttribute('level') ? (firstLight.currentValue('level') as Integer) : null
-		boolean levelMatchesCurrentMode = (currentLightLevel == currentModeSettings.level)
+		// level matching is done within a +/-5 windows because lights do not always set exactly to the request for some reason
+		boolean levelMatchesCurrentMode = (currentLightLevel != null && Math.abs(currentLightLevel - currentModeSettings.level) <= 2.5)
 
 		if (levelMatchesCurrentMode) { // Light on AND matches current mode level -> set to global default level
 			log.info "First light ${firstLight.displayName} ON & matches mode. Setting area to global default brightness; CT unchanged."
