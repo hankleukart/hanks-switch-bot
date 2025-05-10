@@ -1,5 +1,5 @@
 /**
-* Hank's Switch Bot v05-03-2025
+* Hank's Switch Bot v05-09-2025
 * Copyright 2025 Hank Leukart
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -914,11 +914,29 @@ private void handleSceneModeAction(triggeringSwitch, buttonNumber, buttonEvent) 
 private void handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent) {
 	def switchId = triggeringSwitch.id.toString()
 
-	if (isSceneOnlySwitch(switchId)) {
-		log.info "${triggeringSwitch.displayName} is scene-only. Handling taps."
+	def switchInfo = state.switchInfoMap[switchId]
+	boolean isThisSwitchSceneOnly = isSceneOnlySwitch(switchId)
+
+	List<String> roomOrZoneLightIds = []
+	if (switchInfo?.loc?.roomName) {
+		roomOrZoneLightIds = state.switchRoomLights[switchId] ?: []
+	} else if (switchInfo?.loc?.zoneName) {
+		roomOrZoneLightIds = state.switchZoneLights[switchId] ?: []
+	}
+	def allRoomOrZoneLights = getDevicesById(roomOrZoneLightIds, settings.controlledLightsAndScenes) ?: []
+
+	def dimmableRoomOrZoneLights = allRoomOrZoneLights?.findAll { it.hasCapability("SwitchLevel") } ?: []
+
+	if (isThisSwitchSceneOnly) {
+		log.info "${triggeringSwitch.displayName} is scene-only. Handling specific actions including dimming."
+
 		if (buttonNumber == (settings.singleTapUpButtonNumber as Integer) && buttonEvent == settings.singleTapUpButtonEvent) cycleScene(triggeringSwitch, "next")
 		else if (buttonNumber == (settings.singleTapDownButtonNumber as Integer) && buttonEvent == settings.singleTapDownButtonEvent) handleSceneOnlyOff(triggeringSwitch)
-		return
+		else if (buttonNumber == (settings.holdUpButtonNumber as Integer) && buttonEvent == settings.holdUpButtonEvent) handleDimStart(triggeringSwitch, dimmableRoomOrZoneLights, "up")
+		else if (buttonNumber == (settings.releaseUpButtonNumber as Integer) && buttonEvent == settings.releaseUpButtonEvent) handleDimStop(triggeringSwitch, dimmableRoomOrZoneLights)
+		else if (buttonNumber == (settings.holdDownButtonNumber as Integer) && buttonEvent == settings.holdDownButtonEvent) handleDimStart(triggeringSwitch, dimmableRoomOrZoneLights, "down")
+		else if (buttonNumber == (settings.releaseDownButtonNumber as Integer) && buttonEvent == settings.releaseDownButtonEvent) handleDimStop(triggeringSwitch, dimmableRoomOrZoneLights)
+		return // Exit the function after handling scene-only switch actions
 	}
 
 	def areaLights = getDevicesById(state.switchAreaLights[switchId], settings.controlledLightsAndScenes) ?: []
@@ -1060,6 +1078,8 @@ private void handleSceneOnlyOff(triggeringSwitch) {
 	} else {
 		log.warn "No room/zone lights for scene-only switch ${triggeringSwitch.displayName}."
 	}
+
+	state.sceneIndex[switchId] = -1
 }
 
 private void handleDimStart(triggeringSwitch, dimmableAreaLights, String direction) {
