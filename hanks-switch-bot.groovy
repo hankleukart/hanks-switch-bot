@@ -86,11 +86,11 @@ preferences {
 				input(name: "ledOnBrightness_${safeModeName}", type: "number", title: "LED On Brightness (%)", range: "0..100", required: false, width: 2, defaultValue: 30)
 				input(name: "ledOffBrightness_${safeModeName}", type: "number", title: "LED Off Brightness (%)", range: "0..100", required: false, width: 2, defaultValue: 7)
 				
-				// New input field for Sleep mode to specify a zone for turning off LEDs
-				if (currentModeNameLower == "sleep") {
+				// New input field for sleep-like modes to specify a zone for turning off LEDs
+				if (currentModeNameLower.contains("sleep") || currentModeNameLower.contains("night") || currentModeNameLower.contains("bed")) {
 					input(name: "ledOffZone_${safeModeName}", type: "text", 
-						  title: "Turn off LEDs in Sleep mode for zone:", 
-						  description: "If a zone name is entered, LEDs on switches within that zone will be turned completely off (both ON and OFF LEDs set to 0) when in Sleep mode. Other switches will use the Sleep mode's LED brightness settings above.", 
+						  title: "Turn off LEDs in '${mode.name}' mode for zone:", 
+						  description: "If a zone name is entered, LEDs on switches within that zone will be turned completely off (both ON and OFF LEDs set to 0) when in this mode. Other switches will use the mode's LED brightness settings above.", 
 						  required: false, width: 6)
 				}
 				paragraph ""
@@ -113,7 +113,7 @@ preferences {
 		 input "doubleTapDownButtonNumber", "number", title: "Room/Zone Off Button Number", defaultValue: 2, required: false, width: 3
 		 input "doubleTapDownButtonEvent", "enum", title: "Room/Zone Off Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 3
 		 input "holdUpButtonNumber", "number", title: "Brighten Start Button Number", defaultValue: 6, required: false, width: 3
-		 input "holdUpButtonEvent", "enum", title: "Brighten Stop Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 3
+		 input "holdUpButtonEvent", "enum", title: "Brighten Start Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 3
 		 input "releaseUpButtonNumber", "number", title: "Brighten Stop Button Number", defaultValue: 7, required: false, width: 3
 		 input "releaseUpButtonEvent", "enum", title: "Brighten Stop Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 3
 		 input "holdDownButtonNumber", "number", title: "Dim Start Button Number", defaultValue: 6, required: false, width: 3
@@ -229,7 +229,6 @@ def initialize() {
 			if (lightDevice && sInfo?.type != "local") {
 				if (lightDevice.hasCapability("SwitchLevel")) subscribe(lightDevice, "level", firstLightStateHandler)
 				if (lightDevice.hasCapability("Switch")) subscribe(lightDevice, "switch", firstLightStateHandler)
-				if (lightDevice.hasCapability("ColorTemperature")) subscribe(lightDevice, "colorTemperature", firstLightStateHandler)
 			} else if (sInfo?.type == "local") {
 				log.debug "Skipping firstLightStateHandler subscription for light ${lightDevice?.displayName} because its primary switch ${sInfo?.displayName} is local."
 			} else if (!lightDevice) {
@@ -255,13 +254,13 @@ def initialize() {
 				Map effectiveBrightness = calcLEDLevel(sw, state.currentLocationMode, initialModeLedSettings.on, initialModeLedSettings.off)
 				updateLEDs(sw, effectiveBrightness.on, effectiveBrightness.off)
 			}
-			pause(250)
+			pauseExecution(250)
 		}
 	} else {
 		log.warn "Initial location mode not set. Setting LEDs to global defaults."
 		settings.controlledSwitches?.each { sw ->
 			if (sw) updateLEDs(sw, state.globalDefaultLedOnBrightness, state.globalDefaultLedOffBrightness)
-			pause(250)
+			pauseExecution(250)
 		}
 	}
 
@@ -300,7 +299,9 @@ def parseDeviceLocation(device) {
 	String areaName = null
 	String zoneName = null
 
-	def zoneMatcher = device?.name =~ /\s*\[\s*(.*?)\s*\]\s*/ // Zone from device.name
+	// Parse zone from displayName (e.g. label) first, then fallback to label, then name
+	String searchString = device?.displayName ?: device?.label ?: device?.name ?: ""
+	def zoneMatcher = searchString =~ /\s*\[\s*(.*?)\s*\]\s*/
 	if (zoneMatcher?.find()) {
 		zoneName = zoneMatcher[0][1]?.trim()
 	}
@@ -310,6 +311,10 @@ def parseDeviceLocation(device) {
 	}
 
 	String baseDisplayNameForParsing = getParsingName(device) 
+	// Strip out the zone tag from the parsing string to prevent interference with room/area parsing
+	if (baseDisplayNameForParsing) {
+		baseDisplayNameForParsing = baseDisplayNameForParsing.replaceAll(/\s*\[\s*(.*?)\s*\]\s*/, "").trim()
+	} 
 	String deviceRoomProp = null
 	try { deviceRoomProp = device.roomName?.trim() } catch (MissingPropertyException e) { /*ignore*/ }
 
@@ -767,24 +772,23 @@ private Map getModeLedSettings(String targetModeName) {
  * Determines the effective LED brightness for a switch, considering Sleep mode zone overrides.
  */
 private Map calcLEDLevel(switchDevice, String currentModeName, Integer baseModeLedOn, Integer baseModeLedOff) {
-	// Construct the setting name for the sleep mode's LED-off zone.
-	// Assumes "sleep" mode name is consistent. If mode names can vary wildly for "sleep", this might need adjustment.
-	String sleepSafeModeName = "sleep".replaceAll("[^a-zA-Z0-9_]", "_").toLowerCase() // Should resolve to "sleep"
-	String zoneToTurnOffLedsInSleep = settings."ledOffZone_${sleepSafeModeName}"
+	if (!currentModeName) return [on: baseModeLedOn, off: baseModeLedOff]
+	String currentSafeModeName = currentModeName.replaceAll("[^a-zA-Z0-9_]", "_").toLowerCase()
+	String zoneToTurnOffLeds = settings."ledOffZone_${currentSafeModeName}"
 
-	if (currentModeName?.toLowerCase() == "sleep" && zoneToTurnOffLedsInSleep && !zoneToTurnOffLedsInSleep.trim().isEmpty()) {
+	if (zoneToTurnOffLeds && !zoneToTurnOffLeds.trim().isEmpty()) {
 		def switchId = switchDevice.id.toString()
 		// Ensure state.switchIdToLocationMap is populated and accessible
 		if (state.switchIdToLocationMap) {
 			def switchLoc = state.switchIdToLocationMap[switchId]
 			String switchZone = switchLoc?.zoneName?.trim()
 
-			if (switchZone && switchZone.equalsIgnoreCase(zoneToTurnOffLedsInSleep.trim())) {
-				log.debug "Sleep mode: Turning off LEDs for switch ${switchDevice.displayName} in zone '${switchZone}' as per setting for zone '${zoneToTurnOffLedsInSleep.trim()}'."
+			if (switchZone && switchZone.equalsIgnoreCase(zoneToTurnOffLeds.trim())) {
+				log.debug "Mode '${currentModeName}': Turning off LEDs for switch ${switchDevice.displayName} in zone '${switchZone}' as per zone settings."
 				return [on: 0, off: 0] // Override to turn LEDs off
 			}
 		} else {
-			log.warn "calcLEDLevel: state.switchIdToLocationMap not available. Cannot apply Sleep mode zone LED override."
+			log.warn "calcLEDLevel: state.switchIdToLocationMap not available. Cannot apply zone LED override."
 		}
 	}
 	
@@ -1088,7 +1092,7 @@ private void handleDimStart(triggeringSwitch, dimmableAreaLights, String directi
 			try { if (light.hasCommand('setLevel')) light.setLevel(2) } // Low level to turn on
 			catch (e) { log.error "Error setting min level on ${light.displayName}: ${e.message}" }
 		}
-		pause(250) // Pause for lights to turn on
+		pauseExecution(250) // Pause for lights to turn on
 	}
 
 	dimmableAreaLights.each { light ->
@@ -1163,21 +1167,37 @@ def scheduleSceneModeTimeout(triggeringSwitch) {
 	def timeoutSeconds = (timeoutSetting instanceof Number && timeoutSetting > 0) ? timeoutSetting : 7
 	def switchId = triggeringSwitch.id.toString()
 
-	cancelSceneModeTimeout(triggeringSwitch) 
-	state.sceneTimeoutJob[switchId] = runIn(timeoutSeconds, "exitSceneMode", [data: [switchId: switchId], overwrite: true])
+	state.sceneIndex = state.sceneIndex ?: [:]
+	state.sceneMode = state.sceneMode ?: [:]
+
+	// Track the latest activity timestamp for this switch to cancel previous schedules
+	state.lastSceneModeActivity = state.lastSceneModeActivity ?: [:]
+	long timestamp = now()
+	state.lastSceneModeActivity[switchId] = timestamp
+
+	// Schedule the timeout callback
+	runIn(timeoutSeconds, "exitSceneModeIfInactive", [data: [switchId: switchId, scheduledAt: timestamp]])
 	log.debug "Scheduled scene mode timeout for ${triggeringSwitch.displayName} in ${timeoutSeconds}s."
 }
 
 def cancelSceneModeTimeout(triggeringSwitch) {
 	if (!triggeringSwitch) return
 	def switchId = triggeringSwitch.id.toString()
-	if (state.sceneTimeoutJob[switchId]) {
-		try { 
-			unschedule(state.sceneTimeoutJob[switchId]) 
-			log.debug "Unscheduled scene mode timeout for ${triggeringSwitch.displayName}."
-		}
-		catch (e) { log.warn "Error unscheduling scene mode timeout for ${switchId}: ${e.message}" }
-		state.sceneTimeoutJob.remove(switchId) 
+	state.lastSceneModeActivity = state.lastSceneModeActivity ?: [:]
+	state.lastSceneModeActivity[switchId] = null
+	log.debug "Cancelled scene mode timeout for ${triggeringSwitch.displayName}."
+}
+
+def exitSceneModeIfInactive(data) {
+	def switchId = data?.switchId?.toString()
+	def scheduledAt = data?.scheduledAt
+	if (!switchId || !scheduledAt) return
+
+	if (state.lastSceneModeActivity && state.lastSceneModeActivity[switchId] == scheduledAt) {
+		log.info "Scene mode timeout reached for switch ID ${switchId}. Exiting scene mode."
+		exitSceneMode([switchId: switchId])
+	} else {
+		log.debug "Ignoring stale scene mode timeout for switch ID ${switchId}."
 	}
 }
 
@@ -1186,16 +1206,13 @@ def exitSceneMode(data) {
 	
 	if (!switchId) { 
 		log.warn "exitSceneMode called without switchId. Clearing all scene modes."
+		state.lastSceneModeActivity = [:]
 		(state.sceneMode?.keySet() ?: []).each { id ->
 			if (state.sceneMode[id]) { 
 				state.sceneMode[id] = false
 				def sw = getDevicesById(id, settings.controlledSwitches)
 				if (sw) setLedEffect(sw, "solid") 
 				log.info "Exited scene mode for ${sw?.displayName ?: id} (general clear)."
-				if (state.sceneTimeoutJob[id]) {
-					try { unschedule(state.sceneTimeoutJob[id]) } catch(e){}
-					state.sceneTimeoutJob.remove(id)
-				}
 			}
 		}
 		return
@@ -1212,9 +1229,8 @@ def exitSceneMode(data) {
 		state.sceneIndex?.remove(switchId) 
 	}
 	
-	if (state.sceneTimeoutJob[switchId]) {
-		try { unschedule(state.sceneTimeoutJob[switchId]) } catch(e){ /* ignore */ }
-		state.sceneTimeoutJob.remove(switchId)
+	if (state.lastSceneModeActivity) {
+		state.lastSceneModeActivity.remove(switchId)
 	}
 }
 
@@ -1392,3 +1408,4 @@ def updateSwitchControlSummary() {
 	state.switchControlSummary = summary.toString().trim()
 	log.debug("Switch control summary updated.")
 }
+
