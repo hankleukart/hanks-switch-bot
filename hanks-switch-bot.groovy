@@ -695,6 +695,7 @@ def modeChangeHandler(evt) {
 			Map effectiveBrightness = calcLEDLevel(sw, newModeName, newModeLedSettings.on, newModeLedSettings.off)
 			updateLEDs(sw, effectiveBrightness.on, effectiveBrightness.off)
 		}
+		pauseExecution(250)
 	}
 
 	if (previousModeName == null) {
@@ -706,7 +707,7 @@ def modeChangeHandler(evt) {
 	Map prevModeLightSettings = getModeSettings(previousModeName) 
 	Map newModeLightSettings = getModeSettings(newModeName)		 
 
-	settings.controlledLightsAndScenes.each { lightDevice ->
+	settings.controlledLightsAndScenes?.each { lightDevice ->
 		if (isScene(lightDevice) || !lightDevice.hasCapability("Switch") || lightDevice.currentValue('switch') != 'on') return
 
 		boolean levelMatchedPrev = lightDevice.hasCapability("SwitchLevel") ? 
@@ -746,8 +747,8 @@ private void updateLEDs(switchDevice, Integer onBrightness, Integer offBrightnes
 	try {
 		// Parameters 97 (ON LED) & 98 (OFF LED), Size 1 (byte) are common (e.g. Inovelli)
 		log.debug "Setting ${switchDevice.displayName} LED ON to ${onBrightness} (P97), OFF to ${offBrightness} (P98)"
-		switchDevice.setParameter(97, onBrightness, 8) 
-		switchDevice.setParameter(98, offBrightness, 8)
+		switchDevice.setParameter(97, onBrightness, 1) 
+		switchDevice.setParameter(98, offBrightness, 1)
 	} catch (e) {
 		log.error "Error updating LEDs for ${switchDevice.displayName}: ${e.message}"
 	}
@@ -1176,7 +1177,7 @@ def scheduleSceneModeTimeout(triggeringSwitch) {
 	state.lastSceneModeActivity[switchId] = timestamp
 
 	// Schedule the timeout callback
-	runIn(timeoutSeconds, "exitSceneModeIfInactive", [data: [switchId: switchId, scheduledAt: timestamp]])
+	runIn(timeoutSeconds, "exitSceneModeIfInactive", [data: [switchId: switchId, scheduledAt: timestamp], overwrite: false])
 	log.debug "Scheduled scene mode timeout for ${triggeringSwitch.displayName} in ${timeoutSeconds}s."
 }
 
@@ -1315,8 +1316,8 @@ def getDevicesById(def deviceIdInput, Collection deviceListParameter) {
 							  [deviceIdInput.toString()]
 	if (idsToFetch.isEmpty()) return singleIdMode ? null : []
 
-	Map<String, Integer> indexMap = settings.controlledSwitches.is(deviceListParameter) ? state.deviceToIndexMap?.switches :
-									settings.controlledLightsAndScenes.is(deviceListParameter) ? state.deviceToIndexMap?.lightsAndScenes : null
+	Map<String, Integer> indexMap = settings.controlledSwitches?.is(deviceListParameter) ? state.deviceToIndexMap?.switches :
+									settings.controlledLightsAndScenes?.is(deviceListParameter) ? state.deviceToIndexMap?.lightsAndScenes : null
 
 	List foundDevices = []
 	if (indexMap != null) { // Use index map
@@ -1360,7 +1361,7 @@ def updateSwitchControlSummary() {
 	}
 
 	StringBuilder summary = new StringBuilder()
-	def sortedSwitches = settings.controlledSwitches.sort { a, b -> (a.displayName ?: '').toLowerCase() <=> (b.displayName ?: '').toLowerCase() }
+	def sortedSwitches = settings.controlledSwitches.collect().sort { a, b -> (a.displayName ?: '').toLowerCase() <=> (b.displayName ?: '').toLowerCase() }
 
 	sortedSwitches.each { sw ->
 		def switchId = sw.id.toString(); def sInfo = state.switchInfoMap[switchId]
