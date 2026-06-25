@@ -1,5 +1,5 @@
 /**
-* Hank's Switch Bot v06-22-2026
+* Hank's Switch Bot v06-25-2026
 * Copyright 2026 Hank Leukart
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -97,8 +97,8 @@ preferences {
 				
 				if (currentModeNameLower.contains("sleep") || currentModeNameLower.contains("night") || currentModeNameLower.contains("bed")) {
 					input(name: "ledOffZone_${safeModeName}", type: "text", 
-						  title: "Turn off LEDs in \"${mode.name}\" mode for zone:", 
-						  description: "If a zone name is entered, LEDs on switches within that zone will be turned completely off (both ON and OFF LEDs set to 0) when in this mode. Other switches will use the mode's LED brightness settings above.", 
+						  title: "While in \"${mode.name},\" LEDs and lights auto-on disabled for this zone:", 
+						  description: "If a zone name is entered, LEDs on switches within that zone will be turned completely off (both ON and OFF LEDs set to 0) and motion auto-on triggers will be disabled for switches in this zone when in this mode. Other switches will use the mode's LED brightness settings above.", 
 						  required: false, width: 6)
 				}
 				paragraph ""
@@ -302,12 +302,13 @@ def parseDeviceLocation(device) {
 	String areaName = null
 	String zoneName = null
 
-	// Parse zone from displayName (e.g. label) first, then fallback to label, then name
-	String searchString = device?.displayName ?: device?.label ?: device?.name ?: ""
-	def zoneMatcher = searchString =~ /\s*\[\s*(.*?)\s*\]\s*/
-	if (zoneMatcher?.find()) {
-		zoneName = zoneMatcher[0][1]?.trim()
+	// Parse zone from displayName, label, or name (whichever contains brackets)
+	def findZone = { String text ->
+		if (!text) return null
+		def matcher = text =~ /\s*\[\s*(.*?)\s*\]\s*/
+		return matcher.find() ? matcher[0][1]?.trim() : null
 	}
+	zoneName = findZone(device?.displayName) ?: findZone(device?.label) ?: findZone(device?.name)
 
 	if (!device?.displayName) {
 		 return [roomName: null, areaName: null, zoneName: zoneName, parsingName: ""]
@@ -718,13 +719,28 @@ def modeChangeHandler(evt) {
 		if (levelMatchedPrev && ctMatchedPrev) {
 			log.info "Light ${lightDevice.displayName} (ON) matched prev mode '${previousModeName}'. Adjusting to new mode '${newModeName}'."
 			try {
-				if (lightDevice.hasCapability("SwitchLevel")) {
-					lightDevice.setLevel(newModeLightSettings.level)
-				} else if (newModeLightSettings.level > 0 && lightDevice.currentValue('switch') != 'on') {
-					lightDevice.on() // Should already be on, but defensive.
-				}
-				if (newModeLightSettings.enableCt && lightDevice.hasCapability("ColorTemperature") && newModeLightSettings.ct != null) {
-					lightDevice.setColorTemperature(newModeLightSettings.ct)
+				boolean ctChanged = (newModeLightSettings.enableCt && lightDevice.hasCapability("ColorTemperature") && newModeLightSettings.ct != null)
+				if (ctChanged) {
+					log.info "Color temperature is changing for ${lightDevice.displayName} during mode change. Setting CT to ${newModeLightSettings.ct}K and level to ${newModeLightSettings.level}% over a 30-second duration."
+					try {
+						if (lightDevice.hasCapability("SwitchLevel")) {
+							lightDevice.setColorTemperature(newModeLightSettings.ct, newModeLightSettings.level, 30)
+						} else {
+							lightDevice.setColorTemperature(newModeLightSettings.ct, null, 30)
+						}
+					} catch (IllegalArgumentException | MissingMethodException | GroovyRuntimeException ex) {
+						log.warn "Device ${lightDevice.displayName} does not support 3-argument setColorTemperature. Falling back to individual commands."
+						if (lightDevice.hasCapability("SwitchLevel")) {
+							lightDevice.setLevel(newModeLightSettings.level, 30)
+						}
+						lightDevice.setColorTemperature(newModeLightSettings.ct)
+					}
+				} else {
+					if (lightDevice.hasCapability("SwitchLevel")) {
+						lightDevice.setLevel(newModeLightSettings.level)
+					} else if (newModeLightSettings.level > 0 && lightDevice.currentValue('switch') != 'on') {
+						lightDevice.on() // Should already be on, but defensive.
+					}
 				}
 			} catch (e) {
 				log.error "Error adjusting light ${lightDevice.displayName} to new mode: ${e.message}"
@@ -797,28 +813,22 @@ private Map getModeLedSettings(String targetModeName) {
  * Determines the effective LED brightness for a switch, considering Sleep mode zone overrides.
  */
 private Map calcLEDLevel(switchDevice, String currentModeName, Integer baseModeLedOn, Integer baseModeLedOff) {
-	if (!currentModeName) return [on: baseModeLedOn, off: baseModeLedOff]
-	String currentSafeModeName = currentModeName.replaceAll("[^a-zA-Z0-9_]", "_").toLowerCase()
-	String zoneToTurnOffLeds = settings."ledOffZone_${currentSafeModeName}"
-
-	if (zoneToTurnOffLeds && !zoneToTurnOffLeds.trim().isEmpty()) {
-		def switchId = switchDevice.id.toString()
-		// Ensure state.switchIdToLocationMap is populated and accessible
-		if (state.switchIdToLocationMap) {
-			def switchLoc = state.switchIdToLocationMap[switchId]
-			String switchZone = switchLoc?.zoneName?.trim()
-
-			if (switchZone && switchZone.equalsIgnoreCase(zoneToTurnOffLeds.trim())) {
-				log.debug "Mode '${currentModeName}': Turning off LEDs for switch ${switchDevice.displayName} in zone '${switchZone}' as per zone settings."
-				return [on: 0, off: 0] // Override to turn LEDs off
-			}
-		} else {
-			log.warn "calcLEDLevel: state.switchIdToLocationMap not available. Cannot apply zone LED override."
-		}
+	if (isZoneBypassed(switchDevice.id.toString(), currentModeName)) {
+		log.debug "Mode '${currentModeName}': Turning off LEDs for switch ${switchDevice.displayName} as per zone settings."
+		return [on: 0, off: 0]
 	}
-	
-	// Default case: return the base mode-specific or global default LED brightness
 	return [on: baseModeLedOn, off: baseModeLedOff]
+}
+
+private boolean isZoneBypassed(String switchId, String modeName) {
+	if (!modeName) return false
+	String safeModeName = modeName.replaceAll("[^a-zA-Z0-9_]", "_").toLowerCase()
+	String disabledZone = settings."ledOffZone_${safeModeName}"
+	if (disabledZone && !disabledZone.trim().isEmpty() && state.switchIdToLocationMap) {
+		String switchZone = state.switchIdToLocationMap[switchId]?.zoneName?.trim()
+		return switchZone && switchZone.equalsIgnoreCase(disabledZone.trim())
+	}
+	return false
 }
 
 
@@ -918,6 +928,11 @@ def motionHandler(evt) {
 	def buttonEvent
 
 	if (motionState == "active") {
+		if (isZoneBypassed(switchId, state.currentLocationMode)) {
+			log.info "Motion active on ${triggeringSwitch.displayName} ignored because auto-on is disabled for this zone in '${state.currentLocationMode}' mode."
+			return
+		}
+
 		boolean hasIlluminance = triggeringSwitch.hasCapability("IlluminanceMeasurement") || triggeringSwitch.hasCapability("Illuminance Measurement")
 		if (hasIlluminance && settings.motionIlluminanceThreshold != null) {
 			def currentIlluminance = triggeringSwitch.currentValue("illuminance")
@@ -1451,12 +1466,11 @@ def updateSwitchControlSummary() {
 
 	StringBuilder summary = new StringBuilder()
 	def sortedSwitches = settings.controlledSwitches.collect().sort { a, b -> (a.displayName ?: '').toLowerCase() <=> (b.displayName ?: '').toLowerCase() }
-
 	sortedSwitches.each { sw ->
 		def switchId = sw.id.toString(); def sInfo = state.switchInfoMap[switchId]
 		def switchName = sInfo?.displayName ?: sw.displayName ?: "Switch ID ${switchId}"
-		
-		summary.append("<b>${switchName.toUpperCase()}</b> (${sInfo?.type})\n")
+		boolean hasMotion = sInfo?.type != "local" && (sw.hasCapability("MotionSensor") || sw.hasCapability("Motion Sensor"))
+		summary.append("<b>${switchName.toUpperCase()}</b> (${sInfo?.type}${hasMotion ? ' + Motion' : ''})\n")
 
 		def transformName = { String devName, String roomToStrip ->
 			if (!devName) return ""
