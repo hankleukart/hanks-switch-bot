@@ -63,9 +63,6 @@ preferences {
 		input name: "globalDefaultLedOffBrightness", type: "number", title: "Default LED Off Brightness (%)",
 			 description: "Used if a mode has no specific LED OFF brightness.",
 			 range: "0..100", defaultValue: 7, required: true, width: 3
-		input name: "motionIlluminanceThreshold", type: "number", title: "Auto-On Lux Threshold", 
-			 description: "Only trigger auto-on if light level is below this threshold.", 
-			 defaultValue: 50, required: false, width: 4
 		paragraph ""
 
 		if (location.modes) {
@@ -106,6 +103,17 @@ preferences {
 		} else {
 			paragraph "Save settings once to see per-mode configuration options."
 		}
+	}
+
+	section("Auto On/Off Lights (Motion)", hideable: true, hidden: true) {
+		paragraph "Configure which switches can automatically turn lights on/off using their built-in motion sensors, and define the ambient light (Lux) threshold for auto-on triggers."
+		input "motionEnabledSwitches", "enum",
+			title: "Switches that can auto-on/off lights with motion:",
+			options: (settings?.controlledSwitches ?: controlledSwitches)?.findAll { it.hasCapability("MotionSensor") || it.hasCapability("Motion Sensor") }?.collectEntries { [it.id.toString(), it.displayName] } ?: [:],
+			multiple: true, required: false, width: 6
+		input name: "motionIlluminanceThreshold", type: "number", title: "Auto-On Lux Threshold", 
+			 description: "Only trigger auto-on if light level is below this threshold. Leave blank to ignore Lux.", 
+			 defaultValue: 50, required: false, width: 6
 	}
 
 	section("Advanced Button Mappings (Optional)", hideable: true, hidden: true) {
@@ -168,6 +176,8 @@ def initialize() {
 	state.siblingSwitchGroupsBySwitchId = [:]
 	state.switchIdToLocationMap = [:]
 	state.switchInfoMap = [:] 
+	state.motionBypass = [:]
+	state.lastMotionActiveTime = [:]
 
 	state.switchRoomLights = [:]
 	state.switchAreaLights = [:]
@@ -225,7 +235,10 @@ def initialize() {
 					log.warn "Switch ${sw.displayName} does not support PushableButton capability."
 				}
 
-				if (sw.hasCapability("MotionSensor") || sw.hasCapability("Motion Sensor")) {
+				boolean isMotionEnabled = settings.motionEnabledSwitches?.any { val ->
+					(val instanceof String) ? (val == switchIdStr) : (val?.id?.toString() == switchIdStr)
+				}
+				if (isMotionEnabled && (sw.hasCapability("MotionSensor") || sw.hasCapability("Motion Sensor"))) {
 					subscribe(sw, "motion", motionHandler)
 					log.info "Subscribed to motion events on ${sw.displayName}"
 				}
@@ -692,6 +705,8 @@ def modeChangeHandler(evt) {
 	}
 	state.currentLocationMode = newModeName 
 	log.info "Tracked mode updated to '${state.currentLocationMode}'."
+	state.motionBypass = [:]
+	log.info "All temporary motion bypasses cleared due to mode change."
 
 	scheduleLedUpdates(newModeName)
 
@@ -785,10 +800,20 @@ private void updateLEDs(switchDevice, Integer onBrightness, Integer offBrightnes
 	if (!switchDevice || !switchDevice.hasCommand("setParameter")) return
 
 	try {
-		// Parameters 97 (ON LED) & 98 (OFF LED), Size 1 (byte) are common (e.g. Inovelli)
 		log.debug "Setting ${switchDevice.displayName} LED ON to ${onBrightness} (P97), OFF to ${offBrightness} (P98)"
-		switchDevice.setParameter(97, onBrightness, 1) 
-		switchDevice.setParameter(98, offBrightness, 1)
+		try {
+			// Try 2-argument call first so Zigbee Blue drivers can auto-detect the correct 8-bit size
+			switchDevice.setParameter(97, onBrightness)
+		} catch (MissingMethodException | IllegalArgumentException e) {
+			// Fallback to 3-argument call (size 1 byte) for Z-Wave drivers
+			switchDevice.setParameter(97, onBrightness, 1)
+		}
+
+		try {
+			switchDevice.setParameter(98, offBrightness)
+		} catch (MissingMethodException | IllegalArgumentException e) {
+			switchDevice.setParameter(98, offBrightness, 1)
+		}
 	} catch (e) {
 		log.error "Error updating LEDs for ${switchDevice.displayName}: ${e.message}"
 	}
@@ -829,6 +854,19 @@ private boolean isZoneBypassed(String switchId, String modeName) {
 		return switchZone && switchZone.equalsIgnoreCase(disabledZone.trim())
 	}
 	return false
+}
+
+private void setMotionBypass(String switchId) {
+	state.motionBypass = state.motionBypass ?: [:]
+	state.motionBypass[switchId] = true
+	log.info "Motion bypass set (ignored) for switch ID ${switchId}."
+}
+
+private void clearMotionBypass(String switchId) {
+	if (state.motionBypass) {
+		state.motionBypass.remove(switchId)
+		log.info "Motion bypass cleared for switch ID ${switchId}."
+	}
 }
 
 
@@ -895,7 +933,7 @@ def buttonHandler(evt) {
 	if (buttonNumber == (settings.configButtonNumber as Integer) && buttonEvent == settings.configButtonEvent) {
 		if (state.sceneMode[switchId]) {
 			exitSceneMode([switchId: switchId]) 
-		} else if (state.sortedSwitchSceneIds[switchId]?.any()) { // Check if scenes exist
+		} else if (!isSceneOnlySwitch(switchId) && state.sortedSwitchSceneIds[switchId]?.any()) { // Check if scenes exist
 			enterSceneMode(triggeringSwitch)
 		} else {
 			log.info "Config button on ${triggeringSwitch.displayName}, but no scenes. Scene Mode not activated."
@@ -915,6 +953,14 @@ def motionHandler(evt) {
 	def switchId = triggeringSwitch.id.toString()
 	def motionState = evt.value?.toString()
 
+	boolean isMotionEnabled = settings.motionEnabledSwitches?.any { val ->
+		(val instanceof String) ? (val == switchId) : (val?.id?.toString() == switchId)
+	}
+	if (!isMotionEnabled) {
+		log.warn "Motion event received from ${triggeringSwitch.displayName} but it is not enabled in settings. Ignored."
+		return
+	}
+
 	def switchInfo = state.switchInfoMap[switchId]
 	if (switchInfo?.type == "local") {
 		log.info "Motion ${motionState} on Local Switch ${triggeringSwitch.displayName}. Ignored."
@@ -923,6 +969,21 @@ def motionHandler(evt) {
 
 	log.info "Motion ${motionState} on ${triggeringSwitch.displayName}"
 	cancelSceneModeTimeout(triggeringSwitch)
+
+	if (motionState == "active") {
+		state.lastMotionActiveTime = state.lastMotionActiveTime ?: [:]
+		state.lastMotionActiveTime[switchId] = now()
+	}
+
+	if (state.motionBypass && state.motionBypass[switchId]) {
+		if (motionState == "active") {
+			log.info "Motion active on ${triggeringSwitch.displayName} ignored because motion bypass is active."
+		} else if (motionState == "inactive") {
+			log.info "Motion inactive on ${triggeringSwitch.displayName} ignored because motion bypass is active. Scheduling bypass clear in 10 minutes."
+			runIn(600, "checkClearMotionBypass", [data: [switchId: switchId, scheduledAt: now()]])
+		}
+		return
+	}
 
 	def buttonNumber
 	def buttonEvent
@@ -966,6 +1027,24 @@ def motionHandler(evt) {
 	}
 }
 
+def checkClearMotionBypass(data) {
+	def switchId = data?.switchId?.toString()
+	def scheduledAt = data?.scheduledAt
+	if (!switchId || !scheduledAt) return
+
+	state.lastMotionActiveTime = state.lastMotionActiveTime ?: [:]
+	long lastActive = state.lastMotionActiveTime[switchId] ?: 0L
+	long elapsedMs = now() - lastActive
+
+	// 10 minutes = 600,000 milliseconds
+	if (elapsedMs >= 600000) {
+		log.info "No motion detected for 10 minutes on switch ID ${switchId}. Clearing motion bypass."
+		clearMotionBypass(switchId)
+	} else {
+		log.debug "Motion was detected ${elapsedMs / 1000}s ago (less than 10 minutes). Keeping motion bypass active."
+	}
+}
+
 
 private boolean cycleScene(triggeringSwitch, String direction = "next") {
 	def switchId = triggeringSwitch.id.toString()
@@ -988,6 +1067,7 @@ private boolean cycleScene(triggeringSwitch, String direction = "next") {
 	activateScene(roomScenes[newIndex])
 	state.sceneIndex[switchId] = newIndex 
 	log.info "Activated scene '${roomScenes[newIndex]?.displayName}' (${newIndex + 1}/${sceneCount}) for ${triggeringSwitch.displayName}"
+	setMotionBypass(switchId)
 	return true
 }
 
@@ -1103,6 +1183,7 @@ private void handleAreaOn(triggeringSwitch, areaLights) {
 	log.info "handleAreaOn for ${triggeringSwitch.displayName} (${modeUsedForSettings}): ON ${areaLights.size()} lights. Lvl:${targetLevel}%, CT:${targetCt}K (SetCT:${shouldSetCt})"
 
 	applyToLights(areaLights, targetLevel, targetCt, shouldSetCt)
+	clearMotionBypass(triggeringSwitch.id.toString())
 }
 
 private void handleZoneOn(triggeringSwitch) {
@@ -1128,6 +1209,7 @@ private void handleZoneOn(triggeringSwitch) {
 	if (lightsToControl?.any()) {
 		log.info "Zone/Room On by ${triggeringSwitch.displayName}: ${lightsToControl.size()} lights for ${controlScope} to Lvl:${targetSettings.level}%, CT:${targetSettings.ct}K (SetCT:${targetSettings.enableCt})"
 		applyToLights(lightsToControl, targetSettings.level, targetSettings.ct, targetSettings.enableCt)
+		clearMotionBypass(switchId)
 	}
 }
 
@@ -1136,6 +1218,7 @@ private void handleAreaOff(triggeringSwitch, areaLights) {
 	if (areaLights?.any()) {
 		log.info "handleAreaOff for ${triggeringSwitch.displayName}: Turning OFF ${areaLights.size()} area light(s)."
 		turnOffLights(areaLights)
+		setMotionBypass(triggeringSwitch.id.toString())
 	} else {
 		log.info "handleAreaOff for ${triggeringSwitch.displayName}: No area lights to turn off."
 	}
@@ -1160,8 +1243,10 @@ private void handleSceneOnlyOff(triggeringSwitch) {
 	if (lightsToTurnOffIds?.any()) {
 		def lightsToTurnOff = getDevicesById(lightsToTurnOffIds, settings.controlledLightsAndScenes)
 		if (lightsToTurnOff?.any()) {
-			log.info "Turning off ${lightsToTurnOff.size()} lights in ${scope} for scene-only switch ${triggeringSwitch.displayName}."
+			def lightNames = lightsToTurnOff.collect { it.displayName }.join(', ')
+			log.info "Turning off ${lightsToTurnOff.size()} lights (${lightNames}) in ${scope} for scene-only switch ${triggeringSwitch.displayName}."
 			turnOffLights(lightsToTurnOff)
+			setMotionBypass(switchId)
 		} else {
 			log.warn "No light devices for ${scope} for scene-only switch ${triggeringSwitch.displayName}."
 		}
@@ -1243,6 +1328,7 @@ private void handleZoneOff(triggeringSwitch) {
 	if (lightsToControl?.any()) {
 		log.info "Zone/Room Off by ${triggeringSwitch.displayName}: Turning off ${lightsToControl.size()} lights for ${controlScope}"
 		turnOffLights(lightsToControl)
+		setMotionBypass(switchId)
 	}
 }
 
