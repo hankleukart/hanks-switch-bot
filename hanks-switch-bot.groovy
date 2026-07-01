@@ -1,5 +1,5 @@
 /**
-* Hank's Switch Bot v06-25-2026
+* Hank's Switch Bot v07-01-2026
 * Copyright 2026 Hank Leukart
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -67,10 +67,10 @@ preferences {
 
 		if (location.modes) {
 			def defaults = [
-				morning: [level: 100, ct: 3000],
-				day:     [level: 100, ct: 4000],
-				evening: [level: 100, ct: 2700],
-				sleep:   [level: 20,   ct: 2200]
+				morning: [level: 100, ct: 3000, ledOn: 30, ledOff: 7],
+				day:     [level: 100, ct: 4000, ledOn: 30, ledOff: 7],
+				evening: [level: 100, ct: 2700, ledOn: 6, ledOff: 3],
+				sleep:   [level: 40, ct: 2200, ledOn: 6, ledOff: 3]
 			]
 			def sortedModes = location.modes.collect().sort { mode ->
 				def name = mode.name?.toLowerCase() ?: ""
@@ -86,11 +86,13 @@ preferences {
 				def modeDefault = defaults[currentModeNameLower]
 				Integer conditionalDefaultLevel = modeDefault?.level
 				Integer conditionalDefaultCt = modeDefault?.ct
+				Integer conditionalDefaultLedOn = modeDefault?.ledOn != null ? modeDefault.ledOn : 30
+				Integer conditionalDefaultLedOff = modeDefault?.ledOff != null ? modeDefault.ledOff : 7
 
 				input(name: "level_${safeModeName}", type: "number", title: "\"${mode.name}\" Brightness (%)", range: "1..100", required: false, width: 3, defaultValue: conditionalDefaultLevel)
 				input(name: "ct_${safeModeName}", type: "number", title: "\"${mode.name}\" Color Temp (K)", range: "2000..9000", required: false, width: 3, defaultValue: conditionalDefaultCt)
-				input(name: "ledOnBrightness_${safeModeName}", type: "number", title: "LED On Brightness (%)", range: "0..100", required: false, width: 3, defaultValue: 30)
-				input(name: "ledOffBrightness_${safeModeName}", type: "number", title: "LED Off Brightness (%)", range: "0..100", required: false, width: 3, defaultValue: 7)
+				input(name: "ledOnBrightness_${safeModeName}", type: "number", title: "LED On Brightness (%)", range: "0..100", required: false, width: 3, defaultValue: conditionalDefaultLedOn)
+				input(name: "ledOffBrightness_${safeModeName}", type: "number", title: "LED Off Brightness (%)", range: "0..100", required: false, width: 3, defaultValue: conditionalDefaultLedOff)
 				
 				if (currentModeNameLower.contains("sleep") || currentModeNameLower.contains("night") || currentModeNameLower.contains("bed")) {
 					input(name: "ledOffZone_${safeModeName}", type: "text", 
@@ -720,7 +722,7 @@ def modeChangeHandler(evt) {
 	Map newModeLightSettings = getModeSettings(newModeName)		 
 
 	settings.controlledLightsAndScenes?.each { lightDevice ->
-		if (isScene(lightDevice) || !lightDevice.hasCapability("Switch") || lightDevice.currentValue('switch') != 'on') return
+		if (isScene(lightDevice) || isAllLightsGroup(lightDevice) || !lightDevice.hasCapability("Switch") || lightDevice.currentValue('switch') != 'on') return
 
 		Integer prevLightLevel = lightDevice.hasCapability("SwitchLevel") ? (lightDevice.currentValue('level') as Integer) : null
 		boolean levelMatchedPrev = lightDevice.hasCapability("SwitchLevel") ?
@@ -1488,6 +1490,16 @@ def isScene(device) {
 	if (device.typeName && ["CoCoHue Scene", "Scene Activator", "hueBridgeScene", "Virtual Scene Switch", "Advanced Scene Switch"].contains(device.typeName)) return true
 	try { if (device.hasCapability("SceneActivation")) return true } 
 	catch (Exception e) { /* ignore, capability check might fail on some devices/drivers */ }
+	return false
+}
+
+/**
+ * Determines if a device is the "All Hue Lights" whole-home group.
+ */
+def isAllLightsGroup(device) {
+	if (!device) return false
+	String dni = device.deviceNetworkId ?: ''
+	if (dni.endsWith('/0') || (device.displayName instanceof String && device.displayName.toLowerCase().contains("all lights"))) return true
 	return false
 }
 
