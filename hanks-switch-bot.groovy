@@ -1,5 +1,5 @@
 /**
-* Hank's Switch Bot v07-01-2026
+* Hank's Switch Bot v09-10-2026
 * Copyright 2026 Hank Leukart
 *
 * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -13,7 +13,13 @@
 *
 * Hubitat app for automated control of lights/scenes from switches based on device names.
 * Handles 'All'/Master conventions, zone tags, and roomName property.
-* Local switches ("Local Switch" or "(S)") have LEDs updated on mode change only.
+*
+* Each switch's LED bar (its on/off state and level) is kept in sync with the lights it
+* mirrors: event-driven with debouncing, plus a periodic reconciliation sweep so missed
+* device events self-correct. LED indicator brightness adapts to each room's ambient
+* light: lux-sensor driven where a sensor exists, otherwise sun position with a
+* room-lights-on check at night. Local switches ("Local Switch" or "(S)") ignore button
+* presses and LED bar sync, but their LED brightness is still managed.
 */
 
 import groovy.transform.Field
@@ -57,20 +63,14 @@ preferences {
 		input name: "globalDefaultColorTemperature", type: "number", title: "Default Color Temperature (K)",
 			 description: "Used if a mode is enabled for CT but has no specific CT set.",
 			 range: "2000..9000", defaultValue: 2700, required: true, width: 3
-		input name: "globalDefaultLedOnBrightness", type: "number", title: "Default LED On Brightness (%)",
-			 description: "Used if a mode has no specific LED ON brightness.",
-			 range: "0..100", defaultValue: 30, required: true, width: 3
-		input name: "globalDefaultLedOffBrightness", type: "number", title: "Default LED Off Brightness (%)",
-			 description: "Used if a mode has no specific LED OFF brightness.",
-			 range: "0..100", defaultValue: 7, required: true, width: 3
 		paragraph ""
 
 		if (location.modes) {
 			def defaults = [
-				morning: [level: 100, ct: 3000, ledOn: 30, ledOff: 7],
-				day:     [level: 100, ct: 4000, ledOn: 30, ledOff: 7],
-				evening: [level: 100, ct: 2700, ledOn: 6, ledOff: 3],
-				sleep:   [level: 40, ct: 2200, ledOn: 6, ledOff: 3]
+				morning: [level: 100, ct: 3000],
+				day:     [level: 100, ct: 4000],
+				evening: [level: 100, ct: 2700],
+				sleep:   [level: 40, ct: 2200]
 			]
 			def sortedModes = location.modes.collect().sort { mode ->
 				def name = mode.name?.toLowerCase() ?: ""
@@ -86,18 +86,14 @@ preferences {
 				def modeDefault = defaults[currentModeNameLower]
 				Integer conditionalDefaultLevel = modeDefault?.level
 				Integer conditionalDefaultCt = modeDefault?.ct
-				Integer conditionalDefaultLedOn = modeDefault?.ledOn != null ? modeDefault.ledOn : 30
-				Integer conditionalDefaultLedOff = modeDefault?.ledOff != null ? modeDefault.ledOff : 7
 
 				input(name: "level_${safeModeName}", type: "number", title: "\"${mode.name}\" Brightness (%)", range: "1..100", required: false, width: 3, defaultValue: conditionalDefaultLevel)
 				input(name: "ct_${safeModeName}", type: "number", title: "\"${mode.name}\" Color Temp (K)", range: "2000..9000", required: false, width: 3, defaultValue: conditionalDefaultCt)
-				input(name: "ledOnBrightness_${safeModeName}", type: "number", title: "LED On Brightness (%)", range: "0..100", required: false, width: 3, defaultValue: conditionalDefaultLedOn)
-				input(name: "ledOffBrightness_${safeModeName}", type: "number", title: "LED Off Brightness (%)", range: "0..100", required: false, width: 3, defaultValue: conditionalDefaultLedOff)
-				
+
 				if (currentModeNameLower.contains("sleep") || currentModeNameLower.contains("night") || currentModeNameLower.contains("bed")) {
-					input(name: "ledOffZone_${safeModeName}", type: "text", 
-						  title: "While in \"${mode.name},\" LEDs and lights auto-on disabled for this zone:", 
-						  description: "If a zone name is entered, LEDs on switches within that zone will be turned completely off (both ON and OFF LEDs set to 0) and motion auto-on triggers will be disabled for switches in this zone when in this mode. Other switches will use the mode's LED brightness settings above.", 
+					input(name: "ledOffZone_${safeModeName}", type: "text",
+						  title: "While in \"${mode.name},\" LEDs and lights auto-on disabled for this zone:",
+						  description: "If a zone name is entered, LEDs on switches within that zone will be turned completely off (both ON and OFF LEDs set to 0) and motion auto-on triggers will be disabled for switches in this zone when in this mode. Other switches use the Dynamic Switch LED Brightness settings.",
 						  required: false, width: 6)
 				}
 				paragraph ""
@@ -118,6 +114,37 @@ preferences {
 			 defaultValue: 50, required: false, width: 6
 	}
 
+	section("Dynamic Switch LED Brightness", hideable: true, hidden: true) {
+		paragraph "Switch Bot automatically matches each switch's LED brightness to its room's ambient light — bright LEDs in a bright room, dim LEDs in a dark one — so LEDs are always visible but never glaring."
+		input name: "enableDynamicLedBrightness", type: "bool", title: "<b>Enable Dynamic LED Brightness</b>", defaultValue: true, width: 12
+
+		paragraph "<hr /><b>LED Brightness Levels</b><br /><i>LED brightness in a fully bright room vs. a fully dark room. \"Lights On\" and \"Lights Off\" refer to the room's lights; rooms with a light sensor fade smoothly between Bright and Dark levels.</i>"
+		input name: "dynamicLedMaxOn", type: "number", title: "Bright Room, Lights On (%)",
+			 range: "0..100", defaultValue: 30, required: false, width: 3
+		input name: "dynamicLedMaxOff", type: "number", title: "Bright Room, Lights Off (%)",
+			 range: "0..100", defaultValue: 7, required: false, width: 3
+		input name: "dynamicLedMinOn", type: "number", title: "Dark Room, Lights On (%)",
+			 range: "0..100", defaultValue: 3, required: false, width: 3
+		input name: "dynamicLedMinOff", type: "number", title: "Dark Room, Lights Off (%)",
+			 range: "0..100", defaultValue: 2, required: false, width: 3
+
+		paragraph "<hr /><b>Rooms With a Light Sensor</b><br /><i>The room's Lux reading positions LED brightness between the Dark and Bright levels above. If multiple switches in a room have light sensors, one is selected automatically. These settings tune sensitivity.</i>"
+		input name: "dynamicLedMaxLux", type: "number", title: "Bright Room Lux Threshold",
+			 description: "Lux considered fully bright",
+			 range: "10..2000", defaultValue: 100, required: false, width: 3
+		input name: "dynamicLedCooldownMinutes", type: "number", title: "Adjustment Cooldown (min)",
+			 description: "Min minutes between adjustments per room",
+			 range: "1..60", defaultValue: 1, required: false, width: 3
+		input name: "dynamicLedPercentChange", type: "number", title: "Minimum Lux Change (%)",
+			 description: "Relative change required to adjust",
+			 range: "1..100", defaultValue: 20, required: false, width: 3
+		input name: "dynamicLedMinLuxDelta", type: "number", title: "Minimum Lux Delta",
+			 description: "Absolute change required (noise floor)",
+			 range: "1..100", defaultValue: 5, required: false, width: 3
+
+		paragraph "<hr /><b>Rooms Without a Light Sensor</b><br /><i>Sun position decides instead: Bright Room levels during daylight (sunrise+30m to sunset&minus;30m). At night, Bright Room levels while any room light is on, and Dark Room levels once every light in the room is off. No settings needed.</i>"
+	}
+
 	section("Advanced Button Mappings (Optional)", hideable: true, hidden: true) {
 		 input "singleTapUpButtonNumber", "number", title: "On Button Number", defaultValue: 1, required: false, width: 2
 		 input "singleTapUpButtonEvent", "enum", title: "On Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
@@ -125,6 +152,8 @@ preferences {
 		 input "singleTapDownButtonEvent", "enum", title: "Off Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 2
 		 input "configButtonNumber", "number", title: "Scene Mode Button Number", defaultValue: 8, required: false, width: 2
 		 input "configButtonEvent", "enum", title: "Scene Mode Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
+		 input "musicModeButtonNumber", "number", title: "Music Mode Button Number", defaultValue: 9, required: false, width: 2
+		 input "musicModeButtonEvent", "enum", title: "Music Mode Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 2
 		 paragraph "Note: In Scene Mode, the on and off buttons are used for navigating scenes.", width: 12
 		 input "doubleTapUpButtonNumber", "number", title: "Room/Zone On Button Number", defaultValue: 2, required: false, width: 3
 		 input "doubleTapUpButtonEvent", "enum", title: "Room/Zone On Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "pushed", required: false, width: 3
@@ -139,6 +168,10 @@ preferences {
 		 input "releaseDownButtonNumber", "number", title: "Dim Stop Button Number", defaultValue: 7, required: false, width: 3
 		 input "releaseDownButtonEvent", "enum", title: "Dim Stop Button Event", options: ["pushed", "held", "released", "doubleTapped"], defaultValue: "held", required: false, width: 3
 		 input "sceneModeTimeout", "number", title: "Scene Mode Timeout (seconds)", defaultValue: 7, required: false, width: 2
+	}
+
+	section("Music Mode", hideable: true, hidden: true) {
+		input "musicDevice", "capability.musicPlayer", title: "Music Device controlled by Music Mode", required: false, multiple: false
 	}
 }
 
@@ -170,7 +203,7 @@ private void unsubscribeAndUnschedule() {
 
 def initialize() {
 	state.sceneIndex = [:]
-	state.sceneMode = [:]
+	state.activeSwitchMode = [:]
 	state.ledUpdateQueue = []
 	state.modeSettingsMap = [:]
 	state.currentLocationMode = null
@@ -180,14 +213,24 @@ def initialize() {
 	state.switchInfoMap = [:] 
 	state.motionBypass = [:]
 	state.lastMotionActiveTime = [:]
+	state.lastModeActivity = [:]
+	state.activeVolumeLoops = [:]
+	state.roomToSensorSwitchMap = [:]
+	state.sensorSwitchToRoomMap = [:]
+	state.roomLedStatus = state.roomLedStatus ?: [:]
 
 	state.switchRoomLights = [:]
 	state.switchAreaLights = [:]
 	state.switchZoneLights = [:]
 	state.switchScenes = [:]
-	state.firstAreaLightToSwitch = [:] 
-	state.sortedSwitchSceneIds = [:]  
-	state.switchDimmableAreaLightIds = [:] 
+	state.sortedSwitchSceneIds = [:]
+	state.switchDimmableAreaLightIds = [:]
+	state.switchSyncSourceIds = [:]
+	state.lightToSyncSwitchIds = [:]
+	state.pendingLedBarSync = [:]
+	state.lastSwitchInteraction = [:]
+	state.pendingRampUp = [:]
+	state.lastAppliedLedParams = [:] // Reset so initialization re-sends brightness to every switch (self-heal)
 
 	// Build device ID to index maps for faster lookups
 	state.deviceToIndexMap = [switches: [:], lightsAndScenes: [:]]
@@ -213,10 +256,10 @@ def initialize() {
 
 	def buttonEventsToSubscribe = [
 		settings.singleTapUpButtonEvent, settings.singleTapDownButtonEvent,
-		settings.configButtonEvent, settings.doubleTapUpButtonEvent,
-		settings.doubleTapDownButtonEvent, settings.holdUpButtonEvent,
-		settings.releaseUpButtonEvent, settings.holdDownButtonEvent,
-		settings.releaseDownButtonEvent
+		settings.configButtonEvent, settings.musicModeButtonEvent ?: "pushed",
+		settings.doubleTapUpButtonEvent, settings.doubleTapDownButtonEvent,
+		settings.holdUpButtonEvent, settings.releaseUpButtonEvent,
+		settings.holdDownButtonEvent, settings.releaseDownButtonEvent
 	].findAll { it }.unique()
 
 	if (!controlledSwitches) {
@@ -246,27 +289,15 @@ def initialize() {
 				}
 			}
 			state.sceneIndex[switchIdStr] = state.sceneIndex[switchIdStr] ?: -1
-			state.sceneMode[switchIdStr] = state.sceneMode[switchIdStr] ?: false
+			state.activeSwitchMode = state.activeSwitchMode ?: [:]
+			state.activeSwitchMode[switchIdStr] = state.activeSwitchMode[switchIdStr] ?: "normal"
 		}
 	}
 
-	// Subscribe to state changes of the first light in each area for non-local switches.
-	if (state.firstAreaLightToSwitch) {
-		state.firstAreaLightToSwitch.each { lightId, switchId ->
-			def lightDevice = getDevicesById(lightId.toString(), settings.controlledLightsAndScenes)
-			def sInfo = state.switchInfoMap[switchId.toString()] 
+	// LED bar sync: subscribe to level/switch changes on every light each non-local
+	// switch mirrors, so a change from any source updates the switch's LED bar.
+	subscribeToSyncSourceLights()
 
-			if (lightDevice && sInfo?.type != "local") {
-				if (lightDevice.hasCapability("SwitchLevel")) subscribe(lightDevice, "level", firstLightStateHandler)
-				if (lightDevice.hasCapability("Switch")) subscribe(lightDevice, "switch", firstLightStateHandler)
-			} else if (sInfo?.type == "local") {
-				log.debug "Skipping firstLightStateHandler subscription for light ${lightDevice?.displayName} because its primary switch ${sInfo?.displayName} is local."
-			} else if (!lightDevice) {
-				log.warn "Could not find first area light device with ID ${lightId} to subscribe for state sync."
-			}
-		}
-	}
-	
 	state.currentLocationMode = location.currentMode?.name?.toString()?.trim()
 	log.info "Initial location mode tracked as: ${state.currentLocationMode ?: 'UNKNOWN'}"
 
@@ -276,11 +307,22 @@ def initialize() {
 		log.error "Error subscribing to location mode changes: ${e.message}"
 	}
 
+	setupRoomLightSensors()
+
 	// Set initial LED brightness for all switches (staggered via queue to avoid blocking)
 	if (!state.currentLocationMode) {
 		log.warn "Initial location mode not set. Setting LEDs to global defaults."
 	}
 	scheduleLedUpdates(state.currentLocationMode)
+
+	// LED bar sync backstop: reconcile all switches shortly after (re)initialization,
+	// then periodically, so any missed device events self-correct.
+	runIn(15, "reconcileAllLedBars")
+	runEvery5Minutes("reconcileAllLedBars")
+
+	// LED brightness sweep: covers sunrise/sunset boundary crossings for sensor-less
+	// rooms and local switches, which the bar sync engine does not touch.
+	runEvery5Minutes("refreshAllLedBrightness")
 
 	updateSwitchControlSummary()
 	log.info "Initialization complete."
@@ -493,14 +535,13 @@ private void groupSiblingSwitches() {
  */
 def buildDeviceMaps() {
 	log.info "Starting buildDeviceMaps..."
-	state.switchRoomLights = [:]  
-	state.switchAreaLights = [:]  
-	state.switchZoneLights = [:]  
-	state.switchScenes = [:]      
-	state.firstAreaLightToSwitch = [:] 
-	state.sortedSwitchSceneIds = [:]  
-	state.switchDimmableAreaLightIds = [:] 
-	state.switchInfoMap = [:]      
+	state.switchRoomLights = [:]
+	state.switchAreaLights = [:]
+	state.switchZoneLights = [:]
+	state.switchScenes = [:]
+	state.sortedSwitchSceneIds = [:]
+	state.switchDimmableAreaLightIds = [:]
+	state.switchInfoMap = [:]
 
 	Map lightSceneLocations = [:] // Pre-parse light/scene locations
 	settings.controlledLightsAndScenes?.each { dev ->
@@ -589,8 +630,6 @@ def buildDeviceMaps() {
 		if (!currentAreaLightIds.isEmpty()) {
 			def areaLightObjects = getDevicesById(currentAreaLightIds, settings.controlledLightsAndScenes)
 			state.switchDimmableAreaLightIds[switchId] = areaLightObjects?.findAll { it.hasCapability("SwitchLevel") }?.collect { it.id.toString() } ?: []
-			def sortedAreaLightObjects = areaLightObjects?.sort { it.displayName }
-			if (sortedAreaLightObjects?.first()) state.firstAreaLightToSwitch[sortedAreaLightObjects.first().id.toString()] = switchId
 		}
 	}
 
@@ -613,10 +652,6 @@ def buildDeviceMaps() {
 		if (!masterLightIds.isEmpty()) {
 			 def masterLightObjects = getDevicesById(masterLightIds, settings.controlledLightsAndScenes)
 			 state.switchDimmableAreaLightIds[switchId] = masterLightObjects?.findAll { it.hasCapability("SwitchLevel") }?.collect { it.id.toString() } ?: []
-			 def sortedMasterLightObjects = masterLightObjects?.sort { it.displayName }
-			 if (sortedMasterLightObjects?.first() && !state.firstAreaLightToSwitch.containsKey(sortedMasterLightObjects.first().id.toString())) {
-				state.firstAreaLightToSwitch[sortedMasterLightObjects.first().id.toString()] = switchId
-			 }
 		}
 	}
 
@@ -658,6 +693,31 @@ def buildDeviceMaps() {
 			log.info "Associated ${state.sortedSwitchSceneIds[switchId].size()} zone scenes with '${sInfo.displayName}'."
 		}
 	}
+
+	// Step 7: Build LED bar sync maps. Each non-local switch mirrors its area lights,
+	// falling back to room then zone lights (covers master, sibling, and scene-only
+	// switches). The reverse map fans a light event out to every switch mirroring it.
+	state.switchSyncSourceIds = [:]
+	state.lightToSyncSwitchIds = [:]
+	state.switchInfoMap.each { switchId, sInfo ->
+		if (sInfo.type == "local") return
+		List sourceIds = (state.switchAreaLights[switchId] ?: state.switchRoomLights[switchId] ?: state.switchZoneLights[switchId] ?: []) as List
+		sourceIds = sourceIds.findAll { lightId ->
+			def light = getDevicesById(lightId.toString(), settings.controlledLightsAndScenes)
+			light && !isAllLightsGroup(light) && light.hasAttribute("switch")
+		}
+		if (!sourceIds) {
+			log.debug "LED bar sync: no lights to mirror for switch '${sInfo.displayName}'."
+			return
+		}
+		state.switchSyncSourceIds[switchId] = sourceIds
+		sourceIds.each { lightId ->
+			List swIds = state.lightToSyncSwitchIds[lightId] ?: []
+			swIds << switchId
+			state.lightToSyncSwitchIds[lightId] = swIds
+		}
+	}
+	log.info "LED bar sync: mapped ${state.switchSyncSourceIds.size()} switch(es) to ${state.lightToSyncSwitchIds.size()} light(s)."
 	log.info "buildDeviceMaps finished."
 }
 
@@ -667,8 +727,6 @@ def buildModeSettingsMap() {
 	// Ensure global defaults are properly initialized from settings or fallback values
 	state.globalDefaultLevel = (settings.globalDefaultLevel instanceof Number) ? settings.globalDefaultLevel : 100
 	state.globalDefaultColorTemperature = (settings.globalDefaultColorTemperature instanceof Number) ? settings.globalDefaultColorTemperature : 2700
-	state.globalDefaultLedOnBrightness = (settings.globalDefaultLedOnBrightness instanceof Number) ? settings.globalDefaultLedOnBrightness : 30
-	state.globalDefaultLedOffBrightness = (settings.globalDefaultLedOffBrightness instanceof Number) ? settings.globalDefaultLedOffBrightness : 7
 
 	location.modes?.each { mode ->
 		String safeModeName = mode.name.replaceAll("[^a-zA-Z0-9_]", "_").toLowerCase()
@@ -678,18 +736,12 @@ def buildModeSettingsMap() {
 		def rawCt = settings."ct_${safeModeName}"
 		def validatedCt = (rawCt instanceof Number && rawCt >= 2000 && rawCt <= 9000) ? rawCt : null
 		boolean enableCtSetting = (validatedCt != null)
-		def rawLedOn = settings."ledOnBrightness_${safeModeName}"
-		def validatedLedOn = (rawLedOn instanceof Number && rawLedOn >= 0 && rawLedOn <= 100) ? rawLedOn : null
-		def rawLedOff = settings."ledOffBrightness_${safeModeName}"
-		def validatedLedOff = (rawLedOff instanceof Number && rawLedOff >= 0 && rawLedOff <= 100) ? rawLedOff : null
-		// Note: The new setting "ledOffZone_${safeModeName}" is read directly in calcLEDLevel, not stored in state.modeSettingsMap
+		// Note: The setting "ledOffZone_${safeModeName}" is read directly in isZoneBypassed, not stored in state.modeSettingsMap
 
 		newModeSettings[mode.name] = [
 			level: validatedLevel,
 			ct: validatedCt,
-			enableCt: enableCtSetting,
-			ledOn: validatedLedOn,
-			ledOff: validatedLedOff
+			enableCt: enableCtSetting
 		]
 	}
 	state.modeSettingsMap = newModeSettings
@@ -720,9 +772,37 @@ def modeChangeHandler(evt) {
 	log.info "Processing light adjustments for mode change from '${previousModeName}' to '${newModeName}'."
 	Map prevModeLightSettings = getModeSettings(previousModeName) 
 	Map newModeLightSettings = getModeSettings(newModeName)		 
+	log.info "[ModeChange-Log] Mode Settings - Prev Mode '${previousModeName}': level=${prevModeLightSettings?.level}, ct=${prevModeLightSettings?.ct}, enableCt=${prevModeLightSettings?.enableCt}. New Mode '${newModeName}': level=${newModeLightSettings?.level}, ct=${newModeLightSettings?.ct}, enableCt=${newModeLightSettings?.enableCt}."
 
 	settings.controlledLightsAndScenes?.each { lightDevice ->
-		if (isScene(lightDevice) || isAllLightsGroup(lightDevice) || !lightDevice.hasCapability("Switch") || lightDevice.currentValue('switch') != 'on') return
+		if (!lightDevice) return
+
+		String dn = lightDevice.displayName ?: "Unknown Device"
+		String dni = lightDevice.deviceNetworkId ?: "N/A"
+		String typeName = lightDevice.typeName ?: "N/A"
+		boolean isSc = isScene(lightDevice)
+		boolean isAll = isAllLightsGroup(lightDevice)
+		boolean hasSw = lightDevice.hasCapability("Switch")
+		String swVal = hasSw ? lightDevice.currentValue('switch')?.toString() : "N/A"
+
+		log.info "[ModeChange-Log] Evaluating device '${dn}' (Type: ${typeName}, DNI: ${dni}): isScene=${isSc}, isAllLightsGroup=${isAll}, hasSwitchCapability=${hasSw}, switchStatus='${swVal}'"
+
+		if (isSc) {
+			log.info "[ModeChange-Log]   -> Skipped '${dn}' because it is recognized as a Scene."
+			return
+		}
+		if (isAll) {
+			log.info "[ModeChange-Log]   -> Skipped '${dn}' because it is recognized as the All Lights Group."
+			return
+		}
+		if (!hasSw) {
+			log.info "[ModeChange-Log]   -> Skipped '${dn}' because it does not have the 'Switch' capability."
+			return
+		}
+		if (swVal != 'on') {
+			log.info "[ModeChange-Log]   -> Skipped '${dn}' because its current switch status is '${swVal}' (not 'on')."
+			return
+		}
 
 		Integer prevLightLevel = lightDevice.hasCapability("SwitchLevel") ? (lightDevice.currentValue('level') as Integer) : null
 		boolean levelMatchedPrev = lightDevice.hasCapability("SwitchLevel") ?
@@ -733,12 +813,17 @@ def modeChangeHandler(evt) {
 								(lightDevice.currentValue('colorTemperature') != null && 
 								 Math.abs((lightDevice.currentValue('colorTemperature') as Integer) - (prevModeLightSettings.ct as Integer)) <= 50)
 
+		log.info "[ModeChange-Log] Device '${dn}' is ON. Evaluating matching criteria: " +
+		         "prevLightLevel=${prevLightLevel}, targetPrevLevel=${prevModeLightSettings.level}, levelMatchedPrev=${levelMatchedPrev}; " +
+		         "hasColorTemperature=${lightDevice.hasCapability("ColorTemperature")}, enableCt=${prevModeLightSettings.enableCt}, " +
+		         "currentCt=${lightDevice.currentValue('colorTemperature')}, targetPrevCt=${prevModeLightSettings.ct}, ctMatchedPrev=${ctMatchedPrev}."
+
 		if (levelMatchedPrev && ctMatchedPrev) {
-			log.info "Light ${lightDevice.displayName} (ON) matched prev mode '${previousModeName}'. Adjusting to new mode '${newModeName}'."
+			log.info "[ModeChange-Log]   -> SUCCESS: '${dn}' matched prev mode '${previousModeName}'. Adjusting to new mode '${newModeName}'."
 			try {
 				boolean ctChanged = (newModeLightSettings.enableCt && lightDevice.hasCapability("ColorTemperature") && newModeLightSettings.ct != null)
 				if (ctChanged) {
-					log.info "Color temperature is changing for ${lightDevice.displayName} during mode change. Setting CT to ${newModeLightSettings.ct}K and level to ${newModeLightSettings.level}% over a 30-second duration."
+					log.info "[ModeChange-Log]   -> Color temperature changing. Setting CT to ${newModeLightSettings.ct}K and level to ${newModeLightSettings.level}% over a 30-second duration."
 					try {
 						if (lightDevice.hasCapability("SwitchLevel")) {
 							lightDevice.setColorTemperature(newModeLightSettings.ct, newModeLightSettings.level, 30)
@@ -746,7 +831,7 @@ def modeChangeHandler(evt) {
 							lightDevice.setColorTemperature(newModeLightSettings.ct, null, 30)
 						}
 					} catch (IllegalArgumentException | MissingMethodException | GroovyRuntimeException ex) {
-						log.warn "Device ${lightDevice.displayName} does not support 3-argument setColorTemperature. Falling back to individual commands."
+						log.warn "[ModeChange-Log]   -> Device '${dn}' does not support 3-argument setColorTemperature. Falling back to individual commands."
 						if (lightDevice.hasCapability("SwitchLevel")) {
 							lightDevice.setLevel(newModeLightSettings.level, 30)
 						}
@@ -754,31 +839,39 @@ def modeChangeHandler(evt) {
 					}
 				} else {
 					if (lightDevice.hasCapability("SwitchLevel")) {
+						log.info "[ModeChange-Log]   -> Setting level to ${newModeLightSettings.level}% for '${dn}'."
 						lightDevice.setLevel(newModeLightSettings.level)
-					} else if (newModeLightSettings.level > 0 && lightDevice.currentValue('switch') != 'on') {
-						lightDevice.on() // Should already be on, but defensive.
+					} else if (newModeLightSettings.level > 0 && swVal != 'on') {
+						log.info "[ModeChange-Log]   -> Turning ON '${dn}' defensively (new mode level > 0)."
+						lightDevice.on()
+					} else {
+						log.info "[ModeChange-Log]   -> No level adjustment needed for '${dn}' (no SwitchLevel capability, and device already ON)."
 					}
 				}
 			} catch (e) {
-				log.error "Error adjusting light ${lightDevice.displayName} to new mode: ${e.message}"
+				log.error "[ModeChange-Log]   -> ERROR: Failed to adjust light '${dn}' to new mode: ${e.message}"
 			}
+		} else {
+			log.info "[ModeChange-Log]   -> Skipped '${dn}' because it did not match previous mode settings (levelMatchedPrev=${levelMatchedPrev}, ctMatchedPrev=${ctMatchedPrev})."
 		}
 	}
 	log.info "Mode change light adjustments processed."
+	// Mode changes fade lights over up to 30 seconds; reconcile LED bars once settled.
+	runIn(45, "reconcileAllLedBars")
 }
 
 
 /**
  * Queues staggered LED brightness updates for all controlled switches instead of blocking
  * the calling handler with pauseExecution. A new call replaces any in-flight queue, so the
- * most recent mode change wins. Passing a null mode falls back to global default brightness.
+ * most recent trigger (e.g. a mode change) wins.
  */
 private void scheduleLedUpdates(String modeName) {
-	Map modeLedSettings = getModeLedSettings(modeName)
 	List<Map> queue = []
 	settings.controlledSwitches?.each { sw ->
 		if (!sw) return
-		Map effectiveBrightness = calcLEDLevel(sw, modeName, modeLedSettings.on, modeLedSettings.off)
+		Map effectiveBrightness = calcLEDLevel(sw, modeName)
+		if (effectiveBrightness == null) return
 		queue << [id: sw.id.toString(), on: effectiveBrightness.on, off: effectiveBrightness.off]
 	}
 	state.ledUpdateQueue = queue
@@ -790,8 +883,20 @@ def processLedUpdateQueue() {
 	if (!queue) return
 	Map item = queue.remove(0)
 	state.ledUpdateQueue = queue
-	def sw = getDevicesById(item.id?.toString(), settings.controlledSwitches)
-	if (sw) updateLEDs(sw, item.on as Integer, item.off as Integer)
+	String swId = item.id?.toString()
+	Integer targetOn = item.on as Integer
+	Integer targetOff = item.off as Integer
+	// Single choke point for LED parameter writes: skip the radio command when the
+	// target matches the last brightness this app applied to the switch.
+	Map last = state.lastAppliedLedParams ? state.lastAppliedLedParams[swId] : null
+	if (last == null || (last.on as Integer) != targetOn || (last.off as Integer) != targetOff) {
+		def sw = getDevicesById(swId, settings.controlledSwitches)
+		if (sw) {
+			updateLEDs(sw, targetOn, targetOff)
+			state.lastAppliedLedParams = state.lastAppliedLedParams ?: [:]
+			state.lastAppliedLedParams[swId] = [on: targetOn, off: targetOff]
+		}
+	}
 	if (queue) runInMillis(250, "processLedUpdateQueue")
 }
 
@@ -801,50 +906,141 @@ def processLedUpdateQueue() {
 private void updateLEDs(switchDevice, Integer onBrightness, Integer offBrightness) {
 	if (!switchDevice || !switchDevice.hasCommand("setParameter")) return
 
+	// Determine the correct size argument if a 3-argument call is required:
+	// - Zigbee / Blue Series drivers represent a 1-byte parameter with size 8 (bits).
+	// - Z-Wave / Red Series drivers represent a 1-byte parameter with size 1 (byte).
+	String typeNameLower = switchDevice.typeName?.toLowerCase() ?: ""
+	boolean isZwave = typeNameLower.contains("red series") || typeNameLower.contains("z-wave") || typeNameLower.contains("zwave")
+	Integer defaultSize = isZwave ? 1 : 8
+
 	try {
-		log.debug "Setting ${switchDevice.displayName} LED ON to ${onBrightness} (P97), OFF to ${offBrightness} (P98)"
+		log.debug "Setting ${switchDevice.displayName} LED ON to ${onBrightness} (P97), OFF to ${offBrightness} (P98) [isZwave: ${isZwave}, size: ${defaultSize}]"
 		try {
 			// Try 2-argument call first so Zigbee Blue drivers can auto-detect the correct 8-bit size
 			switchDevice.setParameter(97, onBrightness)
 		} catch (MissingMethodException | IllegalArgumentException e) {
-			// Fallback to 3-argument call (size 1 byte) for Z-Wave drivers
-			switchDevice.setParameter(97, onBrightness, 1)
+			switchDevice.setParameter(97, onBrightness, defaultSize)
 		}
 
 		try {
 			switchDevice.setParameter(98, offBrightness)
 		} catch (MissingMethodException | IllegalArgumentException e) {
-			switchDevice.setParameter(98, offBrightness, 1)
+			switchDevice.setParameter(98, offBrightness, defaultSize)
 		}
 	} catch (e) {
 		log.error "Error updating LEDs for ${switchDevice.displayName}: ${e.message}"
 	}
 }
 
-/**
- * Retrieves LED brightness settings for a mode, falling back to global defaults.
- * This provides the base settings before any zone-specific overrides.
- */
-private Map getModeLedSettings(String targetModeName) {
-	String effectiveModeName = targetModeName ?: state.currentLocationMode ?: location.currentMode?.name?.toString()?.trim()
-	Map modeConfig = state.modeSettingsMap[effectiveModeName]
-
-	Integer resolvedLedOn = modeConfig?.ledOn != null ? modeConfig.ledOn : state.globalDefaultLedOnBrightness
-	Integer resolvedLedOff = modeConfig?.ledOff != null ? modeConfig.ledOff : state.globalDefaultLedOffBrightness
-	
-	return [on: resolvedLedOn, off: resolvedLedOff]
+private String getSwitchRoomName(String switchId) {
+	if (!switchId) return null
+	def sInfo = state.switchInfoMap ? state.switchInfoMap[switchId] : null
+	if (sInfo?.loc?.roomName) return sInfo.loc.roomName
+	def loc = state.switchIdToLocationMap ? state.switchIdToLocationMap[switchId] : null
+	return loc?.roomName
 }
 
 /**
- * NEW HELPER FUNCTION
- * Determines the effective LED brightness for a switch, considering Sleep mode zone overrides.
+ * Determines the effective LED brightness for a switch:
+ *   1. Sleep-mode zone override -> LEDs fully off.
+ *   2. Room with a lux sensor -> sensor-driven levels (interpolated Dark<->Bright Room).
+ *   3. Room without a sensor -> sun-based fallback (see computeSensorlessLedLevels).
+ * Returns null when the app should not manage this switch's LED brightness.
  */
-private Map calcLEDLevel(switchDevice, String currentModeName, Integer baseModeLedOn, Integer baseModeLedOff) {
-	if (isZoneBypassed(switchDevice.id.toString(), currentModeName)) {
+private Map calcLEDLevel(switchDevice, String currentModeName) {
+	String swId = switchDevice.id.toString()
+	if (isZoneBypassed(swId, currentModeName)) {
 		log.debug "Mode '${currentModeName}': Turning off LEDs for switch ${switchDevice.displayName} as per zone settings."
 		return [on: 0, off: 0]
 	}
-	return [on: baseModeLedOn, off: baseModeLedOff]
+	if (settings.enableDynamicLedBrightness == false) return null
+
+	String swRoom = getSwitchRoomName(swId)
+	if (swRoom && state.roomToSensorSwitchMap && state.roomToSensorSwitchMap[swRoom]) {
+		def roomStatus = state.roomLedStatus ? state.roomLedStatus[swRoom] : null
+		if (roomStatus?.currentOn != null && roomStatus?.currentOff != null) {
+			return [on: roomStatus.currentOn as Integer, off: roomStatus.currentOff as Integer]
+		}
+	}
+	return computeSensorlessLedLevels(swId)
+}
+
+/**
+ * Sun-based LED brightness for rooms without a lux sensor:
+ *   - Daylight (sunrise+30m to sunset-30m): Bright Room levels.
+ *   - Night with any room light on (room is lit): Bright Room levels.
+ *   - Night with all room lights off (room is dark): Dark Room levels.
+ */
+private Map computeSensorlessLedLevels(String switchId) {
+	Integer minOn = (settings.dynamicLedMinOn != null) ? (settings.dynamicLedMinOn as Integer) : 2
+	Integer maxOn = (settings.dynamicLedMaxOn != null) ? (settings.dynamicLedMaxOn as Integer) : 30
+	Integer minOff = (settings.dynamicLedMinOff != null) ? (settings.dynamicLedMinOff as Integer) : 1
+	Integer maxOff = (settings.dynamicLedMaxOff != null) ? (settings.dynamicLedMaxOff as Integer) : 7
+
+	if (isDaylightWindow() || isAnyRoomLightOn(switchId)) {
+		return [on: maxOn, off: maxOff]
+	}
+	return [on: minOn, off: minOff]
+}
+
+/** True between sunrise+30m and sunset-30m. Fails open (daylight) if sun times are unavailable. */
+private boolean isDaylightWindow() {
+	try {
+		def sun = getSunriseAndSunset()
+		if (!sun?.sunrise || !sun?.sunset) return true
+		long nowMs = now()
+		return nowMs > (sun.sunrise.time + 1800000L) && nowMs < (sun.sunset.time - 1800000L)
+	} catch (e) {
+		log.warn "Could not determine sunrise/sunset (${e.message}). Treating as daylight."
+		return true
+	}
+}
+
+/** True if any light in the switch's room (falling back to its mirrored lights) is on. */
+private boolean isAnyRoomLightOn(String switchId) {
+	List lightIds = (state.switchRoomLights ? state.switchRoomLights[switchId] : null) ?:
+					(state.switchSyncSourceIds ? state.switchSyncSourceIds[switchId] : null) ?: []
+	if (!lightIds) return false
+	def lights = getDevicesById(lightIds, settings.controlledLightsAndScenes)
+	return lights?.any { !isAllLightsGroup(it) && it.currentValue("switch", true) == "on" } ?: false
+}
+
+/** Recomputes one switch's LED brightness and queues an update only if it changed. */
+private void refreshLedBrightness(String switchId) {
+	def sw = getDevicesById(switchId, settings.controlledSwitches)
+	if (!sw) return
+	String modeName = state.currentLocationMode ?: location.currentMode?.name?.toString()?.trim()
+	Map target = calcLEDLevel(sw, modeName)
+	if (target == null) return
+	Map last = state.lastAppliedLedParams ? state.lastAppliedLedParams[switchId] : null
+	if (last == null || (last.on as Integer) != (target.on as Integer) || (last.off as Integer) != (target.off as Integer)) {
+		enqueueLedUpdates([[id: switchId, on: target.on, off: target.off]])
+	}
+}
+
+/**
+ * Periodic LED brightness sweep over all switches (including local switches, which the
+ * bar sync engine skips). Catches sunrise/sunset boundary crossings and external drift;
+ * queues updates only where the target differs from the last applied values.
+ */
+def refreshAllLedBrightness() {
+	if (settings.enableDynamicLedBrightness == false) return
+	String modeName = state.currentLocationMode ?: location.currentMode?.name?.toString()?.trim()
+	List<Map> items = []
+	settings.controlledSwitches?.each { sw ->
+		if (!sw) return
+		Map target = calcLEDLevel(sw, modeName)
+		if (target == null) return
+		String swId = sw.id.toString()
+		Map last = state.lastAppliedLedParams ? state.lastAppliedLedParams[swId] : null
+		if (last == null || (last.on as Integer) != (target.on as Integer) || (last.off as Integer) != (target.off as Integer)) {
+			items << [id: swId, on: target.on, off: target.off]
+		}
+	}
+	if (items) {
+		log.info "LED brightness sweep: adjusting ${items.size()} switch(es)."
+		enqueueLedUpdates(items)
+	}
 }
 
 private boolean isZoneBypassed(String switchId, String modeName) {
@@ -856,6 +1052,233 @@ private boolean isZoneBypassed(String switchId, String modeName) {
 		return switchZone && switchZone.equalsIgnoreCase(disabledZone.trim())
 	}
 	return false
+}
+
+/**
+ * Calculates target LED On and Off brightness from ambient lux using linear interpolation:
+ * Lux 0 -> [minOn, minOff] (default 2%, 1%)
+ * Lux >= maxLux -> [maxOn, maxOff] (default 30%, 7%)
+ */
+private Map calculateTargetLedLevels(Double lux) {
+	Integer minOn = (settings.dynamicLedMinOn != null) ? (settings.dynamicLedMinOn as Integer) : 2
+	Integer maxOn = (settings.dynamicLedMaxOn != null) ? (settings.dynamicLedMaxOn as Integer) : 30
+	Integer minOff = (settings.dynamicLedMinOff != null) ? (settings.dynamicLedMinOff as Integer) : 1
+	Integer maxOff = (settings.dynamicLedMaxOff != null) ? (settings.dynamicLedMaxOff as Integer) : 7
+	Double maxLuxThreshold = (settings.dynamicLedMaxLux != null) ? (settings.dynamicLedMaxLux as Double) : 100.0
+	if (maxLuxThreshold <= 0.0) maxLuxThreshold = 100.0
+
+	Double clampedLux = Math.max(0.0, Math.min(lux ?: 0.0, maxLuxThreshold))
+	Double ratio = clampedLux / maxLuxThreshold
+
+	Integer targetOn = Math.round(minOn + (maxOn - minOn) * ratio) as Integer
+	Integer targetOff = Math.round(minOff + (maxOff - minOff) * ratio) as Integer
+
+	return [on: targetOn, off: targetOff]
+}
+
+/**
+ * Enqueues LED parameter updates for switches, deduplicating in-flight queue entries,
+ * and starts queue processing if it is not already running.
+ */
+private void enqueueLedUpdates(List<Map> items) {
+	if (!items) return
+	List queue = state.ledUpdateQueue ?: []
+	items.each { newItem ->
+		queue.removeAll { it.id == newItem.id }
+		queue << newItem
+	}
+	state.ledUpdateQueue = queue
+	// Always (re)arm the drain timer: if a previous drain chain died (lost timer,
+	// exception), a stale non-empty queue would otherwise never process again.
+	if (queue) runInMillis(250, "processLedUpdateQueue")
+}
+
+/**
+ * Discovers and maps switches with IlluminanceMeasurement capability for each room.
+ * If multiple switches in a room have light sensors, exactly one is selected
+ * (prioritizing the room's master switch, then first alphabetically).
+ */
+private void setupRoomLightSensors() {
+	state.roomToSensorSwitchMap = [:]
+	state.sensorSwitchToRoomMap = [:]
+	state.roomLedStatus = state.roomLedStatus ?: [:]
+
+	if (settings.enableDynamicLedBrightness == false) {
+		log.info "Dynamic switch LED brightness based on room light sensors is disabled."
+		return
+	}
+
+	if (!settings.controlledSwitches) return
+
+	// Group switches with IlluminanceMeasurement by roomName
+	Map<String, List> roomToCandidateSensors = [:]
+	settings.controlledSwitches.each { sw ->
+		if (!sw) return
+		String swId = sw.id.toString()
+		String roomName = getSwitchRoomName(swId)
+		if (!roomName) return
+
+		boolean hasIlluminance = sw.hasCapability("IlluminanceMeasurement") || sw.hasCapability("Illuminance Measurement")
+		if (hasIlluminance) {
+			if (!roomToCandidateSensors.containsKey(roomName)) {
+				roomToCandidateSensors[roomName] = []
+			}
+			roomToCandidateSensors[roomName] << sw
+		}
+	}
+
+	long nowMs = now()
+	roomToCandidateSensors.each { roomName, candidateList ->
+		if (!candidateList) return
+
+		// Select single designated sensor switch for the room:
+		// Prefer master switch if candidate, otherwise sort alphabetically by displayName
+		def selectedSensor = candidateList.find { sw ->
+			def sInfo = state.switchInfoMap ? state.switchInfoMap[sw.id.toString()] : null
+			sInfo?.type == "master"
+		}
+		if (!selectedSensor) {
+			selectedSensor = candidateList.sort { (it.displayName ?: "").toLowerCase() }.first()
+		}
+
+		String sensorId = selectedSensor.id.toString()
+		state.roomToSensorSwitchMap[roomName] = sensorId
+		state.sensorSwitchToRoomMap[sensorId] = roomName
+
+		subscribe(selectedSensor, "illuminance", illuminanceHandler)
+
+		if (candidateList.size() > 1) {
+			log.info "Dynamic LEDs: Room '${roomName}' has ${candidateList.size()} switches with light sensors. Selected '${selectedSensor.displayName}' (ID: ${sensorId}) as designated room sensor."
+		} else {
+			log.info "Dynamic LEDs: Room '${roomName}' using light sensor on '${selectedSensor.displayName}' (ID: ${sensorId})."
+		}
+
+		// Seed initial reading if available on the sensor device
+		def currentIlluminance = selectedSensor.currentValue("illuminance")
+		if (currentIlluminance != null) {
+			try {
+				Double initLux = currentIlluminance as Double
+				Map targetLevels = calculateTargetLedLevels(initLux)
+				state.roomLedStatus[roomName] = [
+					lastUpdated: nowMs,
+					lastLux: initLux,
+					currentOn: targetLevels.on,
+					currentOff: targetLevels.off
+				]
+				log.debug "Dynamic LEDs: Seeded room '${roomName}' with ${initLux} Lux -> ON: ${targetLevels.on}%, OFF: ${targetLevels.off}%"
+			} catch (e) {
+				log.warn "Dynamic LEDs: Error reading initial illuminance from ${selectedSensor.displayName}: ${e.message}"
+			}
+		}
+	}
+}
+
+/**
+ * Handles illuminance events from a room's designated sensor switch.
+ * Enforces a cooldown (default 1 minute), minimum lux change thresholds, and an
+ * integer deadband before queueing parameter updates for all switches in the room.
+ */
+def illuminanceHandler(evt) {
+	if (settings.enableDynamicLedBrightness == false) return
+
+	def sensorSwitch = evt.device
+	if (!sensorSwitch) return
+	String sensorId = sensorSwitch.id.toString()
+	String roomName = state.sensorSwitchToRoomMap ? state.sensorSwitchToRoomMap[sensorId] : null
+	if (!roomName) {
+		roomName = getSwitchRoomName(sensorId)
+	}
+	if (!roomName) {
+		log.debug "Dynamic LEDs: Illuminance event from ${sensorSwitch.displayName}, but no associated room found. Ignoring."
+		return
+	}
+
+	if (evt.value == null) return
+	Double currentLux
+	try {
+		currentLux = evt.value as Double
+	} catch (e) {
+		log.warn "Dynamic LEDs: Could not parse illuminance value '${evt.value}' from ${sensorSwitch.displayName}: ${e.message}"
+		return
+	}
+
+	long nowMs = now()
+	Map roomStatus = (state.roomLedStatus && state.roomLedStatus[roomName]) ? (state.roomLedStatus[roomName] as Map) : [:]
+	long lastUpdatedTime = roomStatus.lastUpdated ?: 0L
+	Integer cooldownMinutes = (settings.dynamicLedCooldownMinutes != null) ? (settings.dynamicLedCooldownMinutes as Integer) : 1
+	long cooldownMs = cooldownMinutes * 60 * 1000L
+
+	// 1. Cooldown check (default 1 minute)
+	if ((nowMs - lastUpdatedTime) < cooldownMs) {
+		long secondsRemaining = ((cooldownMs - (nowMs - lastUpdatedTime)) / 1000).toLong()
+		log.debug "Dynamic LEDs: Cooldown active for room '${roomName}' (${secondsRemaining}s remaining). Skipping update for ${currentLux} Lux."
+		return
+	}
+
+	// 2. 20% change and 5 Lux floor check
+	Double lastRecordedLux = roomStatus.lastLux != null ? (roomStatus.lastLux as Double) : null
+	Double percentThreshold = (settings.dynamicLedPercentChange != null) ? (settings.dynamicLedPercentChange as Double) : 20.0
+	Double minLuxDelta = (settings.dynamicLedMinLuxDelta != null) ? (settings.dynamicLedMinLuxDelta as Double) : 5.0
+
+	if (lastRecordedLux != null) {
+		Double deltaLux = Math.abs(currentLux - lastRecordedLux)
+		Double baseLux = Math.max(lastRecordedLux, 5.0)
+		Double percentChange = (deltaLux / baseLux) * 100.0
+
+		if (deltaLux < minLuxDelta || percentChange < percentThreshold) {
+			log.debug "Dynamic LEDs: Lux change in room '${roomName}' (current: ${currentLux}, last: ${lastRecordedLux}, delta: ${deltaLux.round(1)}, change: ${percentChange.round(1)}%) did not meet thresholds (min delta: ${minLuxDelta}, min %: ${percentThreshold}%). Skipping."
+			return
+		}
+	}
+
+	// 3. Compute target ON and OFF brightness
+	Map targetLevels = calculateTargetLedLevels(currentLux)
+	Integer targetOn = targetLevels.on
+	Integer targetOff = targetLevels.off
+
+	// 4. Integer output deadband check against current applied values
+	Integer currentAppliedOn = roomStatus.currentOn != null ? (roomStatus.currentOn as Integer) : null
+	Integer currentAppliedOff = roomStatus.currentOff != null ? (roomStatus.currentOff as Integer) : null
+
+	if (currentAppliedOn != null && currentAppliedOff != null && targetOn == currentAppliedOn && targetOff == currentAppliedOff) {
+		log.debug "Dynamic LEDs: Target LED levels for room '${roomName}' (ON: ${targetOn}%, OFF: ${targetOff}%) match current levels. Skipping commands."
+		state.roomLedStatus[roomName] = [
+			lastUpdated: nowMs,
+			lastLux: currentLux,
+			currentOn: targetOn,
+			currentOff: targetOff
+		]
+		return
+	}
+
+	// 5. Build queue items for all switches in the room
+	String currentMode = state.currentLocationMode ?: location.currentMode?.name?.toString()?.trim()
+	List<Map> itemsToQueue = []
+
+	settings.controlledSwitches?.each { sw ->
+		if (!sw) return
+		String swId = sw.id.toString()
+		String swRoom = getSwitchRoomName(swId)
+		if (swRoom && swRoom.equalsIgnoreCase(roomName)) {
+			if (isZoneBypassed(swId, currentMode)) {
+				log.debug "Dynamic LEDs: Switch '${sw.displayName}' in room '${roomName}' is zone-bypassed in mode '${currentMode}'. Keeping LEDs at 0."
+				itemsToQueue << [id: swId, on: 0, off: 0]
+			} else {
+				itemsToQueue << [id: swId, on: targetOn, off: targetOff]
+			}
+		}
+	}
+
+	if (itemsToQueue) {
+		log.info "Dynamic LEDs: Adjusting LEDs in room '${roomName}' based on ${currentLux} Lux (Delta: ${lastRecordedLux != null ? Math.round(Math.abs(currentLux - lastRecordedLux)) : 'initial'} Lux). Setting ON: ${targetOn}%, OFF: ${targetOff}% across ${itemsToQueue.size()} switch(es)."
+		state.roomLedStatus[roomName] = [
+			lastUpdated: nowMs,
+			lastLux: currentLux,
+			currentOn: targetOn,
+			currentOff: targetOff
+		]
+		enqueueLedUpdates(itemsToQueue)
+	}
 }
 
 private void setMotionBypass(String switchId) {
@@ -872,46 +1295,147 @@ private void clearMotionBypass(String switchId) {
 }
 
 
-def firstLightStateHandler(evt) {
-	def triggeringLight = evt.device; def lightId = triggeringLight.id.toString()
-	def eventName = evt.name; def eventValue = evt.value
+/**
+ * ============================== LED BAR SYNC ==============================
+ * Keeps each switch's on/off state and level (which drive its LED bar) matched
+ * to the lights it mirrors. Three triggers feed one debounced, staggered queue:
+ *   1. Events: any switch/level event on any mirrored light.
+ *   2. Post-action nudges: scheduled after app-initiated light changes.
+ *   3. Reconciliation: a periodic sweep recomputing every switch from live
+ *      device values, so missed or deduped events self-correct.
+ * Syncs are idempotent: commands are sent only when live values differ.
+ */
 
-	def primarySwitchId = state.firstAreaLightToSwitch[lightId]
-	if (!primarySwitchId) return
+def lightStateSyncHandler(evt) {
+	List switchIds = state.lightToSyncSwitchIds ? state.lightToSyncSwitchIds[evt.device.id.toString()] : null
+	if (switchIds) requestLedBarSync(switchIds)
+}
 
-	def primarySwitchInfo = state.switchInfoMap[primarySwitchId.toString()]
-	if (primarySwitchInfo?.type == "local") { // No sync for local switches
-		log.debug "Primary switch ${primarySwitchInfo.displayName} for light ${triggeringLight.displayName} is local. Skipping state sync."
-		return
+private void subscribeToSyncSourceLights() {
+	if (!state.lightToSyncSwitchIds) return
+	state.lightToSyncSwitchIds.keySet().each { lightId ->
+		def light = getDevicesById(lightId.toString(), settings.controlledLightsAndScenes)
+		if (!light) {
+			log.warn "LED bar sync: could not find light ID ${lightId} to subscribe."
+			return
+		}
+		subscribe(light, "switch", lightStateSyncHandler)
+		if (light.hasAttribute("level")) subscribe(light, "level", lightStateSyncHandler)
 	}
-	
-	List<String> switchIdsToUpdate = state.siblingSwitchGroupsBySwitchId[primarySwitchId] ?: [primarySwitchId]
-	
-	if (eventName == "switch" || eventName == "level") { 
-		log.info "Syncing switch(es) for ${triggeringLight.displayName} (${eventName}=${eventValue}). To update: ${switchIdsToUpdate}"
-	}
+	log.info "LED bar sync: subscribed to ${state.lightToSyncSwitchIds.size()} light(s)."
+}
 
-	switchIdsToUpdate.each { switchIdToSync ->
-		def targetSwitch = getDevicesById(switchIdToSync, settings.controlledSwitches)
-		if (!targetSwitch) {
-			log.warn "Could not find switch ID ${switchIdToSync} for light state sync."
-			return // continue to next switchIdToSync
+/**
+ * Queues switches for an LED bar sync. Debounced: bursts of light events (a scene
+ * hitting several bulbs, a dim ramp) collapse into one evaluation per switch after
+ * the burst settles.
+ */
+private void requestLedBarSync(Collection switchIds, Long delayMs = 750L) {
+	if (!switchIds) return
+	Map pending = state.pendingLedBarSync ?: [:]
+	switchIds.each { id -> if (id) pending[id.toString()] = true }
+	state.pendingLedBarSync = pending
+	if (pending) runInMillis(delayMs, "processLedBarSyncQueue")
+}
+
+/** Maps changed lights to the switches mirroring them, then queues those switches. */
+private void requestLedBarSyncForLights(Collection lightIds, Long delayMs = 2500L) {
+	if (!lightIds || !state.lightToSyncSwitchIds) return
+	Set switchIds = [] as Set
+	lightIds.each { lightId ->
+		List ids = state.lightToSyncSwitchIds[lightId?.toString()]
+		if (ids) switchIds.addAll(ids)
+	}
+	if (switchIds) requestLedBarSync(switchIds, delayMs)
+}
+
+def processLedBarSyncQueue() {
+	Map pending = state.pendingLedBarSync ?: [:]
+	if (!pending) return
+	String switchId = pending.keySet().first()
+	pending.remove(switchId)
+	state.pendingLedBarSync = pending
+	syncLedBar(switchId)
+	// Stagger remaining switches so a full reconcile cannot flood the mesh
+	if (pending) runInMillis(250, "processLedBarSyncQueue")
+}
+
+/**
+ * Computes what the LED bar should show from live (uncached) values of the mirrored
+ * lights: ON if any light is on; level = the brightest on light.
+ */
+private Map computeLedBarReference(String switchId) {
+	List sourceIds = state.switchSyncSourceIds ? state.switchSyncSourceIds[switchId] : null
+	if (!sourceIds) return null
+	def lights = getDevicesById(sourceIds, settings.controlledLightsAndScenes)
+	if (!lights) return null
+	def onLights = lights.findAll { it.currentValue("switch", true) == "on" }
+	if (!onLights) return [on: false, level: null]
+	List levels = onLights.findAll { it.hasAttribute("level") }
+		.collect { it.currentValue("level", true) }
+		.findAll { it != null }
+		.collect { Math.round((it as Double).doubleValue()) as Integer }
+	return [on: true, level: levels ? levels.max() : null]
+}
+
+/**
+ * Applies the computed reference to one switch, sending only commands whose target
+ * differs from the switch's live (uncached) state.
+ */
+private void syncLedBar(String switchId) {
+	def sw = getDevicesById(switchId, settings.controlledSwitches)
+	if (!sw) return
+	if (state.switchInfoMap && state.switchInfoMap[switchId]?.type == "local") return
+	// LED brightness shares the bar sync triggers (light events, nudges, reconcile):
+	// recompute it here so sensor-less rooms react when their lights turn on/off.
+	refreshLedBrightness(switchId)
+	Map ref = computeLedBarReference(switchId)
+	if (ref == null) return
+
+	try {
+		String currentSwitchState = sw.hasAttribute("switch") ? sw.currentValue("switch", true) : null
+
+		if (!ref.on) {
+			if (currentSwitchState != "off" && sw.hasCommand("off")) {
+				log.info "LED bar sync: ${sw.displayName} -> OFF (all mirrored lights off)."
+				sw.off()
+			}
+			return
 		}
 
-		if (eventName == "level") {
-			def newLevel = eventValue as Integer
-			if (targetSwitch.hasCommand("setLevel") && targetSwitch.hasAttribute("level") && (targetSwitch.currentValue('level') as Integer) != newLevel) {
-				try { targetSwitch.setLevel(newLevel) } catch (e) { log.error "Error setting level on ${targetSwitch.displayName}: ${e.message}" }
-			}
-		} else if (eventName == "switch") {
-			def newState = eventValue 
-			if (newState == "on" && targetSwitch.hasCommand("on") && targetSwitch.hasAttribute("switch") && targetSwitch.currentValue('switch') != "on") {
-				 try { targetSwitch.on() } catch (e) { log.error "Error turning ON ${targetSwitch.displayName}: ${e.message}" }
-			} else if (newState == "off" && targetSwitch.hasCommand("off") && targetSwitch.hasAttribute("switch") && targetSwitch.currentValue('switch') != "off") {
-				 try { targetSwitch.off() } catch (e) { log.error "Error turning OFF ${targetSwitch.displayName}: ${e.message}" }
+		boolean levelSent = false
+		if (ref.level != null && sw.hasCommand("setLevel") && sw.hasAttribute("level")) {
+			def rawLevel = sw.currentValue("level", true)
+			Integer currentLevel = (rawLevel != null) ? (Math.round((rawLevel as Double).doubleValue()) as Integer) : null
+			if (currentLevel == null || Math.abs(currentLevel - (ref.level as Integer)) > LEVEL_MATCH_TOLERANCE) {
+				log.info "LED bar sync: ${sw.displayName} -> level ${ref.level}% (was ${currentLevel != null ? "${currentLevel}%" : 'unknown'})."
+				sw.setLevel(ref.level)
+				levelSent = true
 			}
 		}
+		// setLevel implies ON on dimmers; send an explicit on() only when no level was sent
+		if (currentSwitchState != "on" && !levelSent && sw.hasCommand("on")) {
+			log.info "LED bar sync: ${sw.displayName} -> ON."
+			sw.on()
+		}
+	} catch (e) {
+		log.error "LED bar sync: error syncing ${sw.displayName}: ${e.message}"
 	}
+}
+
+/**
+ * Periodic reconciliation backstop. Recomputes every switch from live device state so
+ * any missed events self-correct within one cycle. Switches with a button press in the
+ * last 60 seconds are skipped so the sweep never fights someone at the switch.
+ */
+def reconcileAllLedBars() {
+	if (!state.switchSyncSourceIds) return
+	long nowMs = now()
+	List idsToSync = state.switchSyncSourceIds.keySet().findAll { switchId ->
+		long lastTouch = ((state.lastSwitchInteraction ? state.lastSwitchInteraction[switchId] : null) ?: 0L) as long
+		(nowMs - lastTouch) > 60000L
+	}.collect { it.toString() }
+	if (idsToSync) requestLedBarSync(idsToSync)
 }
 
 def buttonHandler(evt) {
@@ -929,21 +1453,42 @@ def buttonHandler(evt) {
 	}
 
 	log.info "Button ${buttonNumber} (${buttonEvent}) on ${triggeringSwitch.displayName} (Type: ${switchInfo?.type ?: 'Unknown'})"
-	cancelSceneModeTimeout(triggeringSwitch)
+	cancelModeTimeout(triggeringSwitch)
 
-	// Scene Mode Toggle
+	// Track interaction so the periodic LED bar reconcile never fights someone at the switch
+	state.lastSwitchInteraction = state.lastSwitchInteraction ?: [:]
+	state.lastSwitchInteraction[switchId] = now()
+
+	state.activeSwitchMode = state.activeSwitchMode ?: [:]
+	def activeMode = state.activeSwitchMode[switchId] ?: "normal"
+
+	// Music Mode Toggle
+	def musicModeBtnNum = settings.musicModeButtonNumber != null ? (settings.musicModeButtonNumber as Integer) : 9
+	def musicModeBtnEvt = settings.musicModeButtonEvent ?: "pushed"
+	if (buttonNumber == musicModeBtnNum && buttonEvent == musicModeBtnEvt) {
+		if (activeMode == "music") {
+			exitMode(switchId, "music")
+		} else {
+			enterMode(triggeringSwitch, "music")
+		}
+		return
+	}
+
+	// Scene Mode Toggle / Leave Any Mode
 	if (buttonNumber == (settings.configButtonNumber as Integer) && buttonEvent == settings.configButtonEvent) {
-		if (state.sceneMode[switchId]) {
-			exitSceneMode([switchId: switchId]) 
+		if (activeMode != "normal") {
+			exitMode(switchId, activeMode) 
 		} else if (!isSceneOnlySwitch(switchId) && state.sortedSwitchSceneIds[switchId]?.any()) { // Check if scenes exist
-			enterSceneMode(triggeringSwitch)
+			enterMode(triggeringSwitch, "scene")
 		} else {
 			log.info "Config button on ${triggeringSwitch.displayName}, but no scenes. Scene Mode not activated."
 		}
 		return 
 	}
 
-	if (state.sceneMode[switchId]) {
+	if (activeMode == "music") {
+		handleMusicModeAction(triggeringSwitch, buttonNumber, buttonEvent)
+	} else if (activeMode == "scene") {
 		handleSceneModeAction(triggeringSwitch, buttonNumber, buttonEvent)
 	} else {
 		handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent)
@@ -970,7 +1515,7 @@ def motionHandler(evt) {
 	}
 
 	log.info "Motion ${motionState} on ${triggeringSwitch.displayName}"
-	cancelSceneModeTimeout(triggeringSwitch)
+	cancelModeTimeout(triggeringSwitch)
 
 	if (motionState == "active") {
 		state.lastMotionActiveTime = state.lastMotionActiveTime ?: [:]
@@ -1022,8 +1567,13 @@ def motionHandler(evt) {
 	}
 
 	log.info "Motion ${motionState} on ${triggeringSwitch.displayName} mapped to Button ${buttonNumber} (${buttonEvent})"
-	if (state.sceneMode[switchId]) {
+	state.activeSwitchMode = state.activeSwitchMode ?: [:]
+	def activeMode = state.activeSwitchMode[switchId] ?: "normal"
+	if (activeMode == "scene") {
 		handleSceneModeAction(triggeringSwitch, buttonNumber, buttonEvent)
+	} else if (activeMode == "music") {
+		handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent)
+		scheduleModeTimeout(triggeringSwitch, "music")
 	} else {
 		handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent)
 	}
@@ -1067,9 +1617,12 @@ private boolean cycleScene(triggeringSwitch, String direction = "next") {
 	def newIndex = (direction == "previous") ? (currentSceneIndex - 1 + sceneCount) % sceneCount : (currentSceneIndex + 1) % sceneCount
 
 	activateScene(roomScenes[newIndex])
-	state.sceneIndex[switchId] = newIndex 
+	state.sceneIndex[switchId] = newIndex
 	log.info "Activated scene '${roomScenes[newIndex]?.displayName}' (${newIndex + 1}/${sceneCount}) for ${triggeringSwitch.displayName}"
 	setMotionBypass(switchId)
+	// Scenes change bulbs outside this app's direct commands; nudge the LED bar sync
+	// for everything this switch could be mirroring once the scene has settled.
+	requestLedBarSyncForLights(((state.switchAreaLights[switchId] ?: []) + (state.switchRoomLights[switchId] ?: []) + (state.switchZoneLights[switchId] ?: [])).unique(), 3000L)
 	return true
 }
 
@@ -1079,9 +1632,9 @@ private void handleSceneModeAction(triggeringSwitch, buttonNumber, buttonEvent) 
 	else if (buttonNumber == 1 && buttonEvent == "held") sceneActionTaken = cycleScene(triggeringSwitch, "previous")
 	else if (!(buttonNumber == 1 && buttonEvent == "released")) { // Any other button (not release of B1) exits scene mode
 		log.info "Exiting scene mode for ${triggeringSwitch.displayName} due to button ${buttonNumber} ${buttonEvent}."
-		exitSceneMode([switchId: triggeringSwitch.id.toString()])
+		exitMode(triggeringSwitch.id.toString(), "scene")
 	}
-	if (sceneActionTaken) scheduleSceneModeTimeout(triggeringSwitch)
+	if (sceneActionTaken) scheduleModeTimeout(triggeringSwitch, "scene")
 }
 
 private void handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent) {
@@ -1158,24 +1711,25 @@ private void handleAreaOn(triggeringSwitch, areaLights) {
 
 	Map effectiveTargetSettings
 	String modeUsedForSettings = state.currentLocationMode ?: "current (unknown)"
-	
-	def firstLight = areaLights.first() 
-	if (firstLight?.hasAttribute('switch') && firstLight.currentValue('switch') == 'on') {
-		Map currentModeSettings = getModeSettings() 
-		Integer currentLightLevel = firstLight.hasAttribute('level') ? (firstLight.currentValue('level') as Integer) : null
-		boolean levelMatchesCurrentMode = (currentLightLevel != null && Math.abs(currentLightLevel - (currentModeSettings.level as Integer)) <= LEVEL_MATCH_TOLERANCE)
 
-		if (levelMatchesCurrentMode) { // Light on AND matches current mode level -> set to global default level
-			log.info "First light ${firstLight.displayName} ON & matches mode. Setting area to global default brightness; CT unchanged."
+	// Judge the area by the same live group reference the LED bar sync uses:
+	// "on" if any light is on, at the level of the brightest lit light.
+	Map areaRef = computeLedBarReference(triggeringSwitch.id.toString())
+	if (areaRef?.on) {
+		Map currentModeSettings = getModeSettings()
+		boolean levelMatchesCurrentMode = (areaRef.level != null && Math.abs((areaRef.level as Integer) - (currentModeSettings.level as Integer)) <= LEVEL_MATCH_TOLERANCE)
+
+		if (levelMatchesCurrentMode) { // Area on AND at mode level -> boost to global default level
+			log.info "Area lights ON at mode level. Setting area to global default brightness; CT unchanged."
 			effectiveTargetSettings = [level: state.globalDefaultLevel, ct: null, enableCt: false]
 			modeUsedForSettings = "Global Default Level (override)"
-		} else { // Light on but differs from mode -> set to current mode settings
+		} else { // Area on but differs from mode -> set to current mode settings
 			effectiveTargetSettings = currentModeSettings
-			log.info "First light ${firstLight.displayName} ON but differs. Setting area to current mode settings."
+			log.info "Area lights ON at ${areaRef.level}%, differing from mode level. Setting area to current mode settings."
 		}
-	} else { // Light off -> set to current mode settings
+	} else { // Area off -> set to current mode settings
 		effectiveTargetSettings = getModeSettings()
-		log.info "First light ${firstLight?.displayName ?: 'N/A'} OFF. Setting area to current mode settings."
+		log.info "Area lights OFF. Setting area to current mode settings."
 	}
 
 	def targetLevel = effectiveTargetSettings.level
@@ -1186,6 +1740,7 @@ private void handleAreaOn(triggeringSwitch, areaLights) {
 
 	applyToLights(areaLights, targetLevel, targetCt, shouldSetCt)
 	clearMotionBypass(triggeringSwitch.id.toString())
+	requestLedBarSyncForLights(areaLights.collect { it.id.toString() })
 }
 
 private void handleZoneOn(triggeringSwitch) {
@@ -1212,6 +1767,7 @@ private void handleZoneOn(triggeringSwitch) {
 		log.info "Zone/Room On by ${triggeringSwitch.displayName}: ${lightsToControl.size()} lights for ${controlScope} to Lvl:${targetSettings.level}%, CT:${targetSettings.ct}K (SetCT:${targetSettings.enableCt})"
 		applyToLights(lightsToControl, targetSettings.level, targetSettings.ct, targetSettings.enableCt)
 		clearMotionBypass(switchId)
+		requestLedBarSyncForLights(lightsToControlIds)
 	}
 }
 
@@ -1221,6 +1777,7 @@ private void handleAreaOff(triggeringSwitch, areaLights) {
 		log.info "handleAreaOff for ${triggeringSwitch.displayName}: Turning OFF ${areaLights.size()} area light(s)."
 		turnOffLights(areaLights)
 		setMotionBypass(triggeringSwitch.id.toString())
+		requestLedBarSyncForLights(areaLights.collect { it.id.toString() })
 	} else {
 		log.info "handleAreaOff for ${triggeringSwitch.displayName}: No area lights to turn off."
 	}
@@ -1249,6 +1806,7 @@ private void handleSceneOnlyOff(triggeringSwitch) {
 			log.info "Turning off ${lightsToTurnOff.size()} lights (${lightNames}) in ${scope} for scene-only switch ${triggeringSwitch.displayName}."
 			turnOffLights(lightsToTurnOff)
 			setMotionBypass(switchId)
+			requestLedBarSyncForLights(lightsToTurnOffIds)
 		} else {
 			log.warn "No light devices for ${scope} for scene-only switch ${triggeringSwitch.displayName}."
 		}
@@ -1259,6 +1817,12 @@ private void handleSceneOnlyOff(triggeringSwitch) {
 	state.sceneIndex[switchId] = -1
 }
 
+/**
+ * Hold-to-dim start. Lights already on begin ramping immediately. Lights that are off
+ * first turn on at 2%; if the user is still holding the paddle after half a second they
+ * join the ramp, and if the paddle was released first they stay at 2% — so a quick
+ * hold-and-release doubles as a "turn on dimly" gesture.
+ */
 private void handleDimStart(triggeringSwitch, dimmableAreaLights, String direction) {
 	if (!dimmableAreaLights?.any()) {
 		log.info "No dimmable area lights for ${triggeringSwitch.displayName}. Dimming skipped."
@@ -1266,32 +1830,69 @@ private void handleDimStart(triggeringSwitch, dimmableAreaLights, String directi
 	}
 	log.info "handleDimStart for ${triggeringSwitch.displayName}: Start level change '${direction}' for ${dimmableAreaLights.size()} light(s)."
 
-	if (direction == "up" && dimmableAreaLights.first()?.currentValue('switch') == 'off') {
-		log.info "Dimming UP, lights off. Setting to low level first."
-		dimmableAreaLights.each { light ->
-			try { if (light.hasCommand('setLevel')) light.setLevel(2) } // Low level to turn on
-			catch (e) { log.error "Error setting min level on ${light.displayName}: ${e.message}" }
-		}
-		pauseExecution(250) // Pause for lights to turn on
+	if (direction != "up") {
+		startRamp(dimmableAreaLights, direction)
+		return
 	}
 
-	dimmableAreaLights.each { light ->
-		try { if (light.hasCommand('startLevelChange')) light.startLevelChange(direction) } 
+	List offLights = dimmableAreaLights.findAll { it.hasCommand('setLevel') && it.currentValue('switch', true) == 'off' }
+	List onLights = dimmableAreaLights.findAll { light -> !offLights.any { it.id == light.id } }
+
+	offLights.each { light ->
+		try { light.setLevel(2) }
+		catch (e) { log.error "Error setting min level on ${light.displayName}: ${e.message}" }
+	}
+	startRamp(onLights, "up")
+
+	if (offLights) {
+		String switchId = triggeringSwitch.id.toString()
+		long token = now()
+		state.pendingRampUp = state.pendingRampUp ?: [:]
+		state.pendingRampUp[switchId] = [lightIds: offLights.collect { it.id.toString() }, token: token]
+		runInMillis(500, "startDelayedRampUp", [data: [switchId: switchId, token: token], overwrite: false])
+	}
+}
+
+private void startRamp(lights, String direction) {
+	lights?.each { light ->
+		try { if (light.hasCommand('startLevelChange')) light.startLevelChange(direction) }
 		catch (e) { log.error "Error startLevelChange(${direction}) on ${light.displayName}: ${e.message}" }
 	}
 }
 
+/** Fires half a second after hold-up turned off lights on at 2%. A release in the
+ *  meantime removed the pending entry (or replaced its token), making this a no-op. */
+def startDelayedRampUp(data) {
+	String switchId = data?.switchId?.toString()
+	if (!switchId) return
+	Map pending = state.pendingRampUp ? state.pendingRampUp[switchId] : null
+	if (pending == null || (pending.token as Long) != (data.token as Long)) return
+	state.pendingRampUp.remove(switchId)
+	def lights = getDevicesById(pending.lightIds, settings.controlledLightsAndScenes)
+	if (lights) {
+		log.info "Paddle still held after 2% turn-on: ramping up ${lights.size()} light(s)."
+		startRamp(lights, "up")
+	}
+}
+
 private void handleDimStop(triggeringSwitch, dimmableAreaLights) {
+	// Released within the half-second window: cancel the pending ramp so lights that
+	// just turned on stay at 2% (the "turn on dimly" gesture).
+	if (state.pendingRampUp?.remove(triggeringSwitch.id.toString()) != null) {
+		log.info "handleDimStop for ${triggeringSwitch.displayName}: released before ramp delay. Lights stay at 2%."
+	}
+
 	if (dimmableAreaLights?.any()) {
 		log.info "handleDimStop for ${triggeringSwitch.displayName}: Stop level change for ${dimmableAreaLights.size()} light(s)."
 		dimmableAreaLights.each { light ->
-			try { if(light.hasCommand('stopLevelChange')) light.stopLevelChange() } 
+			try { if(light.hasCommand('stopLevelChange')) light.stopLevelChange() }
 			catch (e) { log.error "Error stopLevelChange() on ${light.displayName}: ${e.message}"}
 		}
-		
+
 		// Schedule a refresh on the first dimmable light to query its final settled level
 		def firstLightId = dimmableAreaLights.first().id.toString()
 		runInMillis(500, "refreshDimmableLight", [data: [lightId: firstLightId]])
+		requestLedBarSyncForLights(dimmableAreaLights.collect { it.id.toString() })
 	} else {
 		log.info "handleDimStop for ${triggeringSwitch.displayName}: No dimmable lights to stop."
 	}
@@ -1302,7 +1903,7 @@ def refreshDimmableLight(data) {
 	if (!lightId) return
 	def light = getDevicesById(lightId, settings.controlledLightsAndScenes)
 	if (light && light.hasCommand('refresh')) {
-		log.debug "Refreshing level of ${light.displayName} to sync physical LED bar."
+		log.debug "Refreshing ${light.displayName} so the LED bar sync sees its settled level."
 		try { light.refresh() } catch (e) { log.error "Error refreshing light ${light.displayName}: ${e.message}" }
 	}
 }
@@ -1331,16 +1932,368 @@ private void handleZoneOff(triggeringSwitch) {
 		log.info "Zone/Room Off by ${triggeringSwitch.displayName}: Turning off ${lightsToControl.size()} lights for ${controlScope}"
 		turnOffLights(lightsToControl)
 		setMotionBypass(switchId)
+		requestLedBarSyncForLights(lightsToControlIds)
 	}
 }
 
 
-def enterSceneMode(triggeringSwitch) {
+def enterMode(triggeringSwitch, String mode) {
 	def switchId = triggeringSwitch.id.toString()
-	state.sceneMode[switchId] = true
-	setLedEffect(triggeringSwitch, "chase") 
-	scheduleSceneModeTimeout(triggeringSwitch)
-	log.info "Entered scene mode for ${triggeringSwitch.displayName}"
+	state.activeSwitchMode = state.activeSwitchMode ?: [:]
+	
+	// Automatic Mutual Exclusivity: exit whatever mode is currently active
+	def prevMode = state.activeSwitchMode[switchId]
+	if (prevMode && prevMode != mode) {
+		exitMode(switchId, prevMode)
+	}
+
+	state.activeSwitchMode[switchId] = mode
+
+	// Map of mode names to their respective LED effects and custom hues (null defaults to device setting)
+	def modeLEDConfigs = [
+		scene: [effect: "chase", hue: null],
+		music: [effect: "chase", hue: 21] // 21 is Orange hue
+	]
+
+	def ledConfig = modeLEDConfigs[mode.toLowerCase()]
+	if (ledConfig) {
+		setLedEffect(triggeringSwitch, ledConfig.effect, ledConfig.hue)
+	}
+	
+	scheduleModeTimeout(triggeringSwitch, mode)
+	log.info "Entered ${mode} mode for ${triggeringSwitch.displayName}"
+}
+
+def exitMode(data, String modeOverride = null) {
+	def switchId = null
+	def targetMode = modeOverride
+	
+	if (data instanceof Map) {
+		switchId = data.switchId?.toString()
+		targetMode = data.mode ?: modeOverride
+	} else if (data != null) {
+		switchId = data.toString()
+	}
+
+	if (!switchId) {
+		log.warn "exitMode called without switchId. Clearing all active modes."
+		state.activeSwitchMode = state.activeSwitchMode ?: [:]
+		state.lastModeActivity = [:]
+		state.activeVolumeLoops = [:]
+		if (settings.musicDevice?.hasCommand("stopLevelChange")) {
+			try { settings.musicDevice.stopLevelChange() } catch(e) {}
+		}
+		
+		// Collect keys first to avoid ConcurrentModificationException while modifying map entries inside the loop
+		(state.activeSwitchMode.keySet() ?: []).collect().each { id ->
+			def activeMode = state.activeSwitchMode[id]
+			if (activeMode) {
+				state.activeSwitchMode[id] = null
+				def sw = getDevicesById(id, settings.controlledSwitches)
+				if (sw) setLedEffect(sw, "solid")
+				log.info "Exited ${activeMode} mode for ${sw?.displayName ?: id} (general clear)."
+			}
+		}
+		return
+	}
+
+	state.activeSwitchMode = state.activeSwitchMode ?: [:]
+	def activeMode = state.activeSwitchMode[switchId]
+	if (activeMode && (targetMode == null || activeMode == targetMode)) {
+		state.activeSwitchMode[switchId] = null
+		def triggeringSwitch = getDevicesById(switchId, settings.controlledSwitches)
+		if (triggeringSwitch) {
+			setLedEffect(triggeringSwitch, "solid")
+			log.info "Exited ${activeMode} mode for ${triggeringSwitch.displayName}"
+		} else {
+			log.warn "exitMode: Switch ID ${switchId} not found. Clearing state."
+		}
+		
+		if (state.lastModeActivity) {
+			state.lastModeActivity.remove(switchId)
+		}
+		stopVolumeLoop(switchId)
+		if (activeMode == "music" && settings.musicDevice?.hasCommand("stopLevelChange")) {
+			try { settings.musicDevice.stopLevelChange() } catch(e) {}
+		}
+	}
+}
+
+private void nextSong() {
+	if (!settings.musicDevice) return
+	log.info "Music Mode: Next track on ${settings.musicDevice.displayName}"
+	try {
+		if (settings.musicDevice.hasCommand("nextTrack")) {
+			settings.musicDevice.nextTrack()
+		} else {
+			log.warn "${settings.musicDevice.displayName} does not support nextTrack."
+		}
+	} catch (e) {
+		log.error "Failed to skip to next track: ${e.message}"
+	}
+}
+
+private void prevSong() {
+	if (!settings.musicDevice) return
+	log.info "Music Mode: Previous track on ${settings.musicDevice.displayName}"
+	try {
+		if (settings.musicDevice.hasCommand("previousTrack")) {
+			settings.musicDevice.previousTrack()
+		} else {
+			log.warn "${settings.musicDevice.displayName} does not support previousTrack."
+		}
+	} catch (e) {
+		log.error "Failed to skip to previous track: ${e.message}"
+	}
+}
+
+private void volumeUp() {
+	if (!settings.musicDevice) return
+	log.info "Music Mode: Volume up on ${settings.musicDevice.displayName}"
+	try {
+		if (settings.musicDevice.hasCommand("volumeUp")) {
+			settings.musicDevice.volumeUp()
+		} else {
+			def currentVol = settings.musicDevice.currentValue("volume")
+			int currentVolInt = (currentVol instanceof Number) ? currentVol.toInteger() : 0
+			int newVol = Math.min(currentVolInt + 5, 100)
+			if (settings.musicDevice.hasCommand("setVolume")) {
+				settings.musicDevice.setVolume(newVol)
+			} else {
+				log.warn "${settings.musicDevice.displayName} supports neither volumeUp nor setVolume."
+			}
+		}
+	} catch (e) {
+		log.error "Failed to increase volume: ${e.message}"
+	}
+}
+
+private void volumeDown() {
+	if (!settings.musicDevice) return
+	log.info "Music Mode: Volume down on ${settings.musicDevice.displayName}"
+	try {
+		if (settings.musicDevice.hasCommand("volumeDown")) {
+			settings.musicDevice.volumeDown()
+		} else {
+			def currentVol = settings.musicDevice.currentValue("volume")
+			int currentVolInt = (currentVol instanceof Number) ? currentVol.toInteger() : 0
+			int newVol = Math.max(currentVolInt - 5, 0)
+			if (settings.musicDevice.hasCommand("setVolume")) {
+				settings.musicDevice.setVolume(newVol)
+			} else {
+				log.warn "${settings.musicDevice.displayName} supports neither volumeDown nor setVolume."
+			}
+		}
+	} catch (e) {
+		log.error "Failed to decrease volume: ${e.message}"
+	}
+}
+
+private void stopMusic() {
+	if (!settings.musicDevice) return
+	log.info "Music Mode: Stop on ${settings.musicDevice.displayName}"
+	try {
+		if (settings.musicDevice.hasCommand("stop")) {
+			settings.musicDevice.stop()
+		} else if (settings.musicDevice.hasCommand("pause")) {
+			settings.musicDevice.pause()
+		} else {
+			log.warn "${settings.musicDevice.displayName} supports neither stop nor pause."
+		}
+	} catch (e) {
+		log.error "Failed to stop music: ${e.message}"
+	}
+}
+
+private void playFirstPlaylist() {
+	if (!settings.musicDevice) return
+	def musicDevice = settings.musicDevice
+	def playlistName = null
+	try {
+		def playlistsAttr = musicDevice.currentValue("supportedPlaylists") ?: musicDevice.currentValue("playlists")
+		if (playlistsAttr) {
+			if (playlistsAttr instanceof String) {
+				try {
+					def list = new groovy.json.JsonSlurper().parseText(playlistsAttr)
+					if (list && list.size() > 0) {
+						playlistName = list[0]
+					}
+				} catch (e) {
+					log.warn "Failed to parse playlists JSON: ${e.message}"
+				}
+			} else if (playlistsAttr instanceof List && playlistsAttr.size() > 0) {
+				playlistName = playlistsAttr[0]
+			}
+		}
+	} catch (e) {
+		log.warn "Error reading playlists from ${musicDevice.displayName}: ${e.message}"
+	}
+
+	if (playlistName && musicDevice.hasCommand("playPlaylist")) {
+		log.info "Music Mode: Playing first playlist '${playlistName}' on ${musicDevice.displayName}"
+		try {
+			musicDevice.playPlaylist(playlistName)
+			return
+		} catch (e) {
+			log.error "Failed to play playlist '${playlistName}' via playPlaylist: ${e.message}"
+		}
+	}
+
+	log.info "Music Mode: Falling back to standard play() on ${musicDevice.displayName}"
+	try {
+		if (musicDevice.hasCommand("play")) {
+			musicDevice.play()
+		} else {
+			log.warn "${musicDevice.displayName} does not support play command."
+		}
+	} catch (e) {
+		log.error "Failed to play: ${e.message}"
+	}
+}
+
+private void handleMusicModeAction(triggeringSwitch, buttonNumber, buttonEvent) {
+	if (!settings.musicDevice) {
+		log.warn "Music Mode action triggered, but no music device is selected."
+		return
+	}
+	def switchId = triggeringSwitch.id.toString()
+
+	// Tap up goes to next song. Tap up while nothing is playing plays first playlist.
+	if (buttonNumber == (settings.singleTapUpButtonNumber as Integer) && buttonEvent == settings.singleTapUpButtonEvent) {
+		def status = settings.musicDevice.currentValue("status")
+		if (status?.toString()?.toLowerCase() != "playing") {
+			playFirstPlaylist()
+		} else {
+			nextSong()
+		}
+	}
+	// Tap down goes to prev song
+	else if (buttonNumber == (settings.singleTapDownButtonNumber as Integer) && buttonEvent == settings.singleTapDownButtonEvent) {
+		prevSong()
+	}
+	// Hold up starts raising volume
+	else if (buttonNumber == (settings.holdUpButtonNumber as Integer) && buttonEvent == settings.holdUpButtonEvent) {
+		if (settings.musicDevice.hasCommand("startLevelChange")) {
+			try { settings.musicDevice.startLevelChange("up") }
+			catch (e) { log.error "Error calling startLevelChange(up) on ${settings.musicDevice.displayName}: ${e.message}" }
+		} else {
+			startVolumeLoop(switchId, "up")
+		}
+	}
+	// Release up stops raising volume
+	else if (buttonNumber == (settings.releaseUpButtonNumber as Integer) && buttonEvent == settings.releaseUpButtonEvent) {
+		if (settings.musicDevice.hasCommand("stopLevelChange")) {
+			try { settings.musicDevice.stopLevelChange() }
+			catch (e) { log.error "Error calling stopLevelChange on ${settings.musicDevice.displayName}: ${e.message}" }
+		} else {
+			stopVolumeLoop(switchId)
+		}
+	}
+	// Hold down starts lowering volume
+	else if (buttonNumber == (settings.holdDownButtonNumber as Integer) && buttonEvent == settings.holdDownButtonEvent) {
+		if (settings.musicDevice.hasCommand("startLevelChange")) {
+			try { settings.musicDevice.startLevelChange("down") }
+			catch (e) { log.error "Error calling startLevelChange(down) on ${settings.musicDevice.displayName}: ${e.message}" }
+		} else {
+			startVolumeLoop(switchId, "down")
+		}
+	}
+	// Release down stops lowering volume
+	else if (buttonNumber == (settings.releaseDownButtonNumber as Integer) && buttonEvent == settings.releaseDownButtonEvent) {
+		if (settings.musicDevice.hasCommand("stopLevelChange")) {
+			try { settings.musicDevice.stopLevelChange() }
+			catch (e) { log.error "Error calling stopLevelChange on ${settings.musicDevice.displayName}: ${e.message}" }
+		} else {
+			stopVolumeLoop(switchId)
+		}
+	}
+	// Tap down 2x stops playing
+	else if (buttonNumber == (settings.doubleTapDownButtonNumber as Integer) && buttonEvent == settings.doubleTapDownButtonEvent) {
+		stopMusic()
+	}
+
+	scheduleModeTimeout(triggeringSwitch, "music")
+}
+
+def startVolumeLoop(String switchId, String direction) {
+	state.activeVolumeLoops = state.activeVolumeLoops ?: [:]
+	
+	// Generate a unique transaction timestamp for this loop start
+	long runId = now()
+	state.activeVolumeLoops[switchId] = [direction: direction, runId: runId]
+	
+	runVolumeLoop([switchId: switchId, direction: direction, runId: runId])
+}
+
+def stopVolumeLoop(String switchId) {
+	state.activeVolumeLoops = state.activeVolumeLoops ?: [:]
+	state.activeVolumeLoops.remove(switchId)
+}
+
+def runVolumeLoop(Map data) {
+	def switchId = data.switchId
+	def direction = data.direction
+	def runId = data.runId
+	
+	state.activeVolumeLoops = state.activeVolumeLoops ?: [:]
+	def activeLoop = state.activeVolumeLoops[switchId]
+	
+	if (!activeLoop || activeLoop.direction != direction || activeLoop.runId != runId) {
+		log.debug "Volume loop for switch ${switchId} in direction ${direction} (runId: ${runId}) is no longer active. Stopping."
+		return
+	}
+
+	if (!settings.musicDevice) {
+		log.warn "Volume loop: no music device is selected."
+		stopVolumeLoop(switchId)
+		return
+	}
+
+	// Change volume
+	if (direction == "up") {
+		volumeUp()
+	} else {
+		volumeDown()
+	}
+
+	// Schedule the next step in 500ms
+	runInMillis(500, "runVolumeLoop", [data: [switchId: switchId, direction: direction, runId: runId], overwrite: false])
+}
+
+def scheduleModeTimeout(triggeringSwitch, String mode, Integer customTimeout = null) {
+	def timeoutSetting = customTimeout ?: settings.sceneModeTimeout
+	def timeoutSeconds = (timeoutSetting instanceof Number && timeoutSetting > 0) ? timeoutSetting : 7
+	def switchId = triggeringSwitch.id.toString()
+
+	state.lastModeActivity = state.lastModeActivity ?: [:]
+	long timestamp = now()
+	state.lastModeActivity[switchId] = [timestamp: timestamp, mode: mode]
+
+	// Schedule the timeout callback
+	runIn(timeoutSeconds, "exitModeIfInactive", [data: [switchId: switchId, scheduledAt: timestamp, mode: mode], overwrite: false])
+	log.debug "Scheduled ${mode} mode timeout for ${triggeringSwitch.displayName} in ${timeoutSeconds}s."
+}
+
+def cancelModeTimeout(triggeringSwitch) {
+	if (!triggeringSwitch) return
+	def switchId = triggeringSwitch.id.toString()
+	state.lastModeActivity = state.lastModeActivity ?: [:]
+	state.lastModeActivity.remove(switchId)
+	log.debug "Cancelled mode timeout for ${triggeringSwitch.displayName}."
+}
+
+def exitModeIfInactive(data) {
+	def switchId = data?.switchId?.toString()
+	def scheduledAt = data?.scheduledAt
+	def mode = data?.mode
+	if (!switchId || !scheduledAt || !mode) return
+
+	if (state.lastModeActivity && state.lastModeActivity[switchId]?.timestamp == scheduledAt && state.activeSwitchMode[switchId] == mode) {
+		log.info "${mode} mode timeout reached for switch ID ${switchId}. Exiting ${mode} mode."
+		exitMode(switchId, mode)
+	} else {
+		log.debug "Ignoring stale timeout for switch ID ${switchId} (mode: ${mode})."
+	}
 }
 
 def activateScene(sceneDevice) {
@@ -1355,89 +2308,21 @@ def activateScene(sceneDevice) {
 	}
 }
 
-def scheduleSceneModeTimeout(triggeringSwitch) {
-	def timeoutSetting = settings.sceneModeTimeout
-	def timeoutSeconds = (timeoutSetting instanceof Number && timeoutSetting > 0) ? timeoutSetting : 7
-	def switchId = triggeringSwitch.id.toString()
 
-	state.sceneIndex = state.sceneIndex ?: [:]
-	state.sceneMode = state.sceneMode ?: [:]
-
-	// Track the latest activity timestamp for this switch to cancel previous schedules
-	state.lastSceneModeActivity = state.lastSceneModeActivity ?: [:]
-	long timestamp = now()
-	state.lastSceneModeActivity[switchId] = timestamp
-
-	// Schedule the timeout callback
-	runIn(timeoutSeconds, "exitSceneModeIfInactive", [data: [switchId: switchId, scheduledAt: timestamp], overwrite: false])
-	log.debug "Scheduled scene mode timeout for ${triggeringSwitch.displayName} in ${timeoutSeconds}s."
-}
-
-def cancelSceneModeTimeout(triggeringSwitch) {
-	if (!triggeringSwitch) return
-	def switchId = triggeringSwitch.id.toString()
-	state.lastSceneModeActivity = state.lastSceneModeActivity ?: [:]
-	state.lastSceneModeActivity.remove(switchId)
-	log.debug "Cancelled scene mode timeout for ${triggeringSwitch.displayName}."
-}
-
-def exitSceneModeIfInactive(data) {
-	def switchId = data?.switchId?.toString()
-	def scheduledAt = data?.scheduledAt
-	if (!switchId || !scheduledAt) return
-
-	if (state.lastSceneModeActivity && state.lastSceneModeActivity[switchId] == scheduledAt) {
-		log.info "Scene mode timeout reached for switch ID ${switchId}. Exiting scene mode."
-		exitSceneMode([switchId: switchId])
-	} else {
-		log.debug "Ignoring stale scene mode timeout for switch ID ${switchId}."
-	}
-}
-
-def exitSceneMode(data) {
-	def switchId = data?.switchId?.toString() 
-	
-	if (!switchId) { 
-		log.warn "exitSceneMode called without switchId. Clearing all scene modes."
-		state.lastSceneModeActivity = [:]
-		(state.sceneMode?.keySet() ?: []).each { id ->
-			if (state.sceneMode[id]) { 
-				state.sceneMode[id] = false
-				def sw = getDevicesById(id, settings.controlledSwitches)
-				if (sw) setLedEffect(sw, "solid") 
-				log.info "Exited scene mode for ${sw?.displayName ?: id} (general clear)."
-			}
-		}
-		return
-	}
-
-	def triggeringSwitch = getDevicesById(switchId, settings.controlledSwitches)
-	if (triggeringSwitch && state.sceneMode[switchId]) {
-		state.sceneMode[switchId] = false
-		setLedEffect(triggeringSwitch, "solid") 
-		log.info "Exited scene mode for ${triggeringSwitch.displayName}"
-	} else if (!triggeringSwitch) {
-		log.warn "exitSceneMode: Switch ID ${switchId} not found. Clearing state."
-		state.sceneMode?.remove(switchId) 
-		state.sceneIndex?.remove(switchId) 
-	}
-	
-	if (state.lastSceneModeActivity) {
-		state.lastSceneModeActivity.remove(switchId)
-	}
-}
-
-
-def setLedEffect(switchDevice, effectName) {
+def setLedEffect(switchDevice, effectName, hueOverride = null) {
 	if (!switchDevice || !switchDevice.hasCommand('ledEffectAll')) return
 	try {
 		Integer hue = 170 // Default hue
-		try { // Attempt to get hue from device setting parameter 95
-			if (switchDevice.metaClass.respondsTo(switchDevice, "getSetting")) {
-				def settingVal = switchDevice.getSetting('parameter95') 
-				if (settingVal?.toString()) hue = settingVal.toString().toInteger()
-			}
-		} catch (Exception e) { /* Default hue will be used */ }
+		if (hueOverride != null) {
+			hue = hueOverride as Integer
+		} else {
+			try { // Attempt to get hue from device setting parameter 95
+				if (switchDevice.metaClass.respondsTo(switchDevice, "getSetting")) {
+					def settingVal = switchDevice.getSetting('parameter95') 
+					if (settingVal?.toString()) hue = settingVal.toString().toInteger()
+				}
+			} catch (Exception e) { /* Default hue will be used */ }
+		}
 		
 		Integer effectCode = (effectName.toLowerCase() == "chase") ? 17 : 255 // 17=chase, 255=solid (device specific)
 		switchDevice.ledEffectAll(effectCode, hue, 100, 255) // Brightness 100%, Duration 255 (indefinite)
@@ -1448,21 +2333,18 @@ def setLedEffect(switchDevice, effectName) {
 }
 
 /**
- * Gets light (level, CT, enableCt) and LED (onLed, offLed) settings for a mode.
+ * Gets light (level, CT, enableCt) settings for a mode.
  * Falls back to global defaults if mode-specific settings are missing.
  */
 private Map getModeSettings(String targetModeName = null) {
 	String effectiveModeName = targetModeName ?: state.currentLocationMode ?: location.currentMode?.name?.toString()?.trim()
-	Map modeConfig = state.modeSettingsMap[effectiveModeName] 
+	Map modeConfig = state.modeSettingsMap[effectiveModeName]
 
 	Integer finalLevel = modeConfig?.level ?: state.globalDefaultLevel
 	Boolean resolvedEnableCt = modeConfig ? modeConfig.enableCt : (targetModeName != null) // Enable CT if specific mode requested but not found, else false
 	Integer finalCt = resolvedEnableCt ? (modeConfig?.ct ?: state.globalDefaultColorTemperature) : null
-	
-	Integer finalLedOn = modeConfig?.ledOn != null ? modeConfig.ledOn : state.globalDefaultLedOnBrightness
-	Integer finalLedOff = modeConfig?.ledOff != null ? modeConfig.ledOff : state.globalDefaultLedOffBrightness
-	
-	return [level: finalLevel, ct: finalCt, enableCt: resolvedEnableCt, onLed: finalLedOn, offLed: finalLedOff]
+
+	return [level: finalLevel, ct: finalCt, enableCt: resolvedEnableCt]
 }
 
 
@@ -1494,12 +2376,19 @@ def isScene(device) {
 }
 
 /**
- * Determines if a device is the "All Hue Lights" whole-home group.
+ * Determines if a device is the "All Hue Lights" whole-home group. Hue Groups for the whole house should not be controlled due to a variety of corner case bugs that result
  */
 def isAllLightsGroup(device) {
 	if (!device) return false
 	String dni = device.deviceNetworkId ?: ''
-	if (dni.endsWith('/0') || (device.displayName instanceof String && device.displayName.toLowerCase().contains("all lights"))) return true
+	if (dni.endsWith('/0')) return true
+	if (device.displayName instanceof String) {
+		String dnLower = device.displayName.toLowerCase().trim()
+		if (dnLower.contains("all hue lights") || 
+		    dnLower == "home (hue group)") {
+			return true
+		}
+	}
 	return false
 }
 
@@ -1568,7 +2457,8 @@ def updateSwitchControlSummary() {
 		def switchId = sw.id.toString(); def sInfo = state.switchInfoMap[switchId]
 		def switchName = sInfo?.displayName ?: sw.displayName ?: "Switch ID ${switchId}"
 		boolean hasMotion = sInfo?.type != "local" && (sw.hasCapability("MotionSensor") || sw.hasCapability("Motion Sensor"))
-		summary.append("<b>${switchName.toUpperCase()}</b> (${sInfo?.type}${hasMotion ? ' + Motion' : ''})\n")
+		boolean isLightSensor = state.sensorSwitchToRoomMap ? (state.sensorSwitchToRoomMap[switchId] != null) : false
+		summary.append("<b>${switchName.toUpperCase()}</b> (${sInfo?.type}${hasMotion ? ' + Motion' : ''}${isLightSensor ? ' + Light Sensor' : ''})\n")
 
 		def transformName = { String devName, String roomToStrip ->
 			if (!devName) return ""
