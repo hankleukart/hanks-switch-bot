@@ -17,9 +17,11 @@
 * Each switch's LED bar (its on/off state and level) is kept in sync with the lights it
 * mirrors: event-driven with debouncing, plus a periodic reconciliation sweep so missed
 * device events self-correct. LED indicator brightness adapts to each room's ambient
-* light: lux-sensor driven where a sensor exists, otherwise sun position with a
-* room-lights-on check at night. Local switches ("Local Switch" or "(S)") ignore button
-* presses and LED bar sync, but their LED brightness is still managed.
+* light: lux-sensor driven where a sensor exists, otherwise sun position, scaling with
+* the room's light level at night. A switch named with an "(in Room)" suffix takes its
+* LED brightness from that room instead of the room it controls. Local switches
+* ("Local Switch" or "(S)") ignore button presses and LED bar sync, but their LED
+* brightness is still managed.
 */
 
 import groovy.transform.Field
@@ -115,10 +117,9 @@ preferences {
 	}
 
 	section("Dynamic Switch LED Brightness", hideable: true, hidden: true) {
-		paragraph "Switch Bot automatically matches each switch's LED brightness to its room's ambient light — bright LEDs in a bright room, dim LEDs in a dark one — so LEDs are always visible but never glaring."
 		input name: "enableDynamicLedBrightness", type: "bool", title: "<b>Enable Dynamic LED Brightness</b>", defaultValue: true, width: 12
 
-		paragraph "<hr /><b>LED Brightness Levels</b><br /><i>LED brightness in a fully bright room vs. a fully dark room. \"Lights On\" and \"Lights Off\" refer to the room's lights; rooms with a light sensor fade smoothly between Bright and Dark levels.</i>"
+		paragraph "<hr /><b>LED Brightness Levels</b><br /><i>LED brightness in a fully bright room vs. a fully dark room. \"Lights On\" and \"Lights Off\" refer to the room's lights. LEDs fade smoothly between the Dark and Bright levels.</i>"
 		input name: "dynamicLedMaxOn", type: "number", title: "Bright Room, Lights On (%)",
 			 range: "0..100", defaultValue: 30, required: false, width: 3
 		input name: "dynamicLedMaxOff", type: "number", title: "Bright Room, Lights Off (%)",
@@ -128,10 +129,10 @@ preferences {
 		input name: "dynamicLedMinOff", type: "number", title: "Dark Room, Lights Off (%)",
 			 range: "0..100", defaultValue: 2, required: false, width: 3
 
-		paragraph "<hr /><b>Rooms With a Light Sensor</b><br /><i>The room's Lux reading positions LED brightness between the Dark and Bright levels above. If multiple switches in a room have light sensors, one is selected automatically. These settings tune sensitivity.</i>"
+		paragraph "<b>Rooms With a Light Sensor</b><br /><i>The room's Lux reading positions LED brightness between the Dark and Bright levels above. If multiple switches in a room have light sensors, one is selected automatically. These settings tune sensitivity.</i>"
 		input name: "dynamicLedMaxLux", type: "number", title: "Bright Room Lux Threshold",
 			 description: "Lux considered fully bright",
-			 range: "10..2000", defaultValue: 100, required: false, width: 3
+			 range: "10..2000", defaultValue: 150, required: false, width: 3
 		input name: "dynamicLedCooldownMinutes", type: "number", title: "Adjustment Cooldown (min)",
 			 description: "Min minutes between adjustments per room",
 			 range: "1..60", defaultValue: 1, required: false, width: 3
@@ -142,7 +143,7 @@ preferences {
 			 description: "Absolute change required (noise floor)",
 			 range: "1..100", defaultValue: 5, required: false, width: 3
 
-		paragraph "<hr /><b>Rooms Without a Light Sensor</b><br /><i>Sun position decides instead: Bright Room levels during daylight (sunrise+30m to sunset&minus;30m). At night, Bright Room levels while any room light is on, and Dark Room levels once every light in the room is off. No settings needed.</i>"
+		paragraph "<b>Rooms Without a Light Sensor</b><br /><i>Bright Room levels during daylight (sunrise+30m to sunset&minus;30m). At night, LED brightness follows the room's lights: Dark Room levels with every light off, rising toward Bright Room levels as the brightest light in the room approaches 100%. No settings needed.</i>"
 	}
 
 	section("Advanced Button Mappings (Optional)", hideable: true, hidden: true) {
@@ -209,7 +210,8 @@ def initialize() {
 	state.currentLocationMode = null
 	state.switchControlSummary = "Initializing or no switches configured..."
 	state.siblingSwitchGroupsBySwitchId = [:]
-	state.switchIdToLocationMap = [:]
+	state.switchIdToControlMap = [:]
+	state.remove("switchIdToLocationMap") // Key used by older versions; state persists across saves
 	state.switchInfoMap = [:] 
 	state.motionBypass = [:]
 	state.lastMotionActiveTime = [:]
@@ -227,7 +229,10 @@ def initialize() {
 	state.switchDimmableAreaLightIds = [:]
 	state.switchSyncSourceIds = [:]
 	state.lightToSyncSwitchIds = [:]
+	state.lightToBrightnessSwitchIds = [:]
 	state.pendingLedBarSync = [:]
+	state.pendingLedBrightnessRefresh = [:]
+	state.pendingLuxRetry = [:] // Reset alongside unschedule(); a stale entry would block retries
 	state.lastSwitchInteraction = [:]
 	state.pendingRampUp = [:]
 	state.lastAppliedLedParams = [:] // Reset so initialization re-sends brightness to every switch (self-heal)
@@ -244,7 +249,7 @@ def initialize() {
 	if (settings.controlledSwitches) {
 		settings.controlledSwitches.each { sw ->
 			if (sw?.id) {
-				state.switchIdToLocationMap[sw.id.toString()] = parseDeviceLocation(sw)
+				state.switchIdToControlMap[sw.id.toString()] = parseDeviceLocation(sw)
 			}
 		}
 	}
@@ -294,9 +299,9 @@ def initialize() {
 		}
 	}
 
-	// LED bar sync: subscribe to level/switch changes on every light each non-local
-	// switch mirrors, so a change from any source updates the switch's LED bar.
-	subscribeToSyncSourceLights()
+	// Subscribe to level/switch changes on every light that drives a switch's LED bar
+	// or LED brightness, so a change from any source updates the switches.
+	subscribeToLightChanges()
 
 	state.currentLocationMode = location.currentMode?.name?.toString()?.trim()
 	log.info "Initial location mode tracked as: ${state.currentLocationMode ?: 'UNKNOWN'}"
@@ -430,10 +435,28 @@ def parseDeviceLocation(device) {
 
 
 /**
+ * Resolves an "(in X)" name suffix, which marks the room a switch physically sits in, to
+ * a known room name. Used only for LED brightness. Returns null if the name has no such
+ * suffix or X matches no known room.
+ */
+private String resolveLedRoom(String displayName, Map<String, String> knownRooms) {
+	def matcher = (displayName ?: "") =~ /(?i)\(\s*in\s+([^()]+?)\s*\)/
+	if (!matcher.find()) return null
+	String requested = matcher.group(1)
+	String room = knownRooms[normalizeDeviceName(requested).toLowerCase()]
+	if (!room) {
+		log.warn "Switch '${displayName}': \"(in ${requested})\" matches no known room. Its LED brightness follows the room it controls."
+		return null
+	}
+	log.info "Switch '${displayName}': LED brightness follows room '${room}'."
+	return room
+}
+
+/**
  * Normalizes room names for switches with same base display name but different roomName properties.
  */
 private void normalizeSwitchRoomNames() {
-	if (settings.controlledSwitches == null || settings.controlledSwitches.isEmpty() || state.switchIdToLocationMap == null || state.switchIdToLocationMap.isEmpty()) {
+	if (settings.controlledSwitches == null || settings.controlledSwitches.isEmpty() || state.switchIdToControlMap == null || state.switchIdToControlMap.isEmpty()) {
 		return
 	}
 
@@ -449,10 +472,10 @@ private void normalizeSwitchRoomNames() {
 
 		List<Map> switchInfoForGroup = []
 		switchIdsInGroup.each { id ->
-			def loc = state.switchIdToLocationMap[id]
+			def control = state.switchIdToControlMap[id]
 			def device = getDevicesById(id, settings.controlledSwitches)
-			if (loc && device?.displayName) {
-				 switchInfoForGroup << [id: id, displayName: device.displayName, parsedRoomName: loc.roomName, effectiveName: loc.parsingName]
+			if (control && device?.displayName) {
+				 switchInfoForGroup << [id: id, displayName: device.displayName, parsedRoomName: control.roomName, effectiveName: control.parsingName]
 			}
 		}
 		
@@ -481,11 +504,11 @@ private void normalizeSwitchRoomNames() {
 			log.info "Normalizing room names for switches like '${baseDisplayNameKey}' to '${authoritativeRoomName}' (from '${authSwitchDisplayName}')."
 			switchIdsInGroup.each { idToUpdate ->
 				if (idToUpdate != authoritativeSwitchId) {
-					def currentLocMap = state.switchIdToLocationMap[idToUpdate]
-					if (currentLocMap && currentLocMap.roomName != authoritativeRoomName) {
-						Map newLoc = new HashMap(currentLocMap)
-						newLoc.roomName = authoritativeRoomName 
-						state.switchIdToLocationMap[idToUpdate] = newLoc 
+					def currentControl = state.switchIdToControlMap[idToUpdate]
+					if (currentControl && currentControl.roomName != authoritativeRoomName) {
+						Map newControl = new HashMap(currentControl)
+						newControl.roomName = authoritativeRoomName
+						state.switchIdToControlMap[idToUpdate] = newControl
 						log.debug "Updated roomName for switch ID ${idToUpdate} to '${authoritativeRoomName}'"
 					}
 				}
@@ -501,7 +524,7 @@ private void normalizeSwitchRoomNames() {
  */
 private void groupSiblingSwitches() {
 	state.siblingSwitchGroupsBySwitchId = [:]
-	if (settings.controlledSwitches == null || settings.controlledSwitches.isEmpty() || state.switchIdToLocationMap == null || state.switchIdToLocationMap.isEmpty()) {
+	if (settings.controlledSwitches == null || settings.controlledSwitches.isEmpty() || state.switchIdToControlMap == null || state.switchIdToControlMap.isEmpty()) {
 		return
 	}
 
@@ -509,14 +532,14 @@ private void groupSiblingSwitches() {
 
 	settings.controlledSwitches.each { swDevice ->
 		def switchId = swDevice.id.toString()
-		def loc = state.switchIdToLocationMap[switchId]
-		if (!loc?.roomName || !swDevice?.displayName) return
+		def control = state.switchIdToControlMap[switchId]
+		if (!control?.roomName || !swDevice?.displayName) return
 
-		String expectedBaseMasterSwitchName = "${loc.roomName} Switch"
+		String expectedBaseMasterSwitchName = "${control.roomName} Switch"
 		// Group if displayName is "RoomName Switch" or "RoomName Switch (suffix)"
 		if (swDevice.displayName.equalsIgnoreCase(expectedBaseMasterSwitchName) || 
 			swDevice.displayName.toLowerCase().startsWith(expectedBaseMasterSwitchName.toLowerCase() + " (")) {
-			String groupKey = "${loc.roomName}::${expectedBaseMasterSwitchName}" // Group by room and base name
+			String groupKey = "${control.roomName}::${expectedBaseMasterSwitchName}" // Group by room and base name
 			potentialGroups[groupKey] << switchId
 		}
 	}
@@ -542,18 +565,31 @@ def buildDeviceMaps() {
 	state.sortedSwitchSceneIds = [:]
 	state.switchDimmableAreaLightIds = [:]
 	state.switchInfoMap = [:]
+	state.switchLedRoomLights = [:]
 
 	Map lightSceneLocations = [:] // Pre-parse light/scene locations
 	settings.controlledLightsAndScenes?.each { dev ->
 		if (dev?.id) lightSceneLocations[dev.id.toString()] = parseDeviceLocation(dev)
 	}
 
-	// Step 1: Populate switchInfoMap (type, stem, loc, etc.)
+	// Known room names (normalized, lower-cased -> spelling as parsed), so an "(in X)"
+	// suffix resolves to the room other devices already use. Switch rooms go first
+	// because the lux sensor lookup is keyed by their spelling.
+	Map<String, String> knownRooms = [:]
+	((state.switchIdToControlMap?.values() ?: []) + lightSceneLocations.values()).each { parsed ->
+		if (!parsed?.roomName) return
+		String key = normalizeDeviceName(parsed.roomName).toLowerCase()
+		if (!knownRooms.containsKey(key)) knownRooms[key] = parsed.roomName
+	}
+
+	// Step 1: Populate switchInfoMap (type, stem, control, etc.). "control" is the
+	// room/area/zone parsed from the switch's name, i.e. what it controls; that can
+	// differ from where it is installed, which is "ledRoom" (an "(in X)" suffix).
 	settings.controlledSwitches?.each { sw ->
 		if (!sw?.id) return
 
 		def switchId = sw.id.toString()
-		def switchLoc = state.switchIdToLocationMap[switchId]
+		def switchControl = state.switchIdToControlMap[switchId]
 		String originalDisplayName = sw.displayName?.trim() ?: ""
 		String type, stem
 		boolean isLocal = false
@@ -576,15 +612,16 @@ def buildDeviceMaps() {
 					stem = stem.substring(0, stem.length() - " all".length()).trim()
 				}
 				log.debug "Switch '${originalDisplayName}' (ID: ${switchId}) -> ALL. Stem: '${stem}'."
-			} else if (switchLoc?.roomName && !switchLoc.roomName.isEmpty() && stem.equalsIgnoreCase(switchLoc.roomName.trim())) {
+			} else if (switchControl?.roomName && !switchControl.roomName.isEmpty() && stem.equalsIgnoreCase(switchControl.roomName.trim())) {
 				type = "master"
-				log.debug "Switch '${originalDisplayName}' (ID: ${switchId}) -> MASTER. Stem: '${stem}' (Room: '${switchLoc.roomName}')."
+				log.debug "Switch '${originalDisplayName}' (ID: ${switchId}) -> MASTER. Stem: '${stem}' (Room: '${switchControl.roomName}')."
 			} else {
 				type = "regular"
 				log.debug "Switch '${originalDisplayName}' (ID: ${switchId}) -> REGULAR. Stem: '${stem}'."
 			}
 		}
-		state.switchInfoMap[switchId] = [type: type, stem: stem, loc: switchLoc, displayName: originalDisplayName, isLocal: isLocal]
+		String ledRoom = resolveLedRoom(originalDisplayName, knownRooms)
+		state.switchInfoMap[switchId] = [type: type, stem: stem, control: switchControl, displayName: originalDisplayName, isLocal: isLocal, ledRoom: ledRoom]
 		state.switchAreaLights[switchId] = []; state.switchDimmableAreaLightIds[switchId] = []
 		state.switchScenes[switchId] = []; state.sortedSwitchSceneIds[switchId] = []
 	}
@@ -593,21 +630,31 @@ def buildDeviceMaps() {
 	settings.controlledSwitches?.each { sw ->
 		if (!sw?.id) return
 		def switchId = sw.id.toString(); def sInfo = state.switchInfoMap[switchId]
-		if (!sInfo?.loc) {
+		if (!sInfo?.control) {
 			log.warn "buildDeviceMaps: No location for switch ID ${switchId} ('${sw.displayName}') for room/zone lights."
 			state.switchRoomLights[switchId] = []; state.switchZoneLights[switchId] = []
 			return
 		}
 		state.switchRoomLights[switchId] = settings.controlledLightsAndScenes?.findAll { light ->
-			!isScene(light) && light?.id && lightSceneLocations[light.id.toString()]?.roomName && sInfo.loc?.roomName && 
-			normalizeDeviceName(lightSceneLocations[light.id.toString()].roomName).equalsIgnoreCase(normalizeDeviceName(sInfo.loc.roomName))
+			!isScene(light) && light?.id && lightSceneLocations[light.id.toString()]?.roomName && sInfo.control?.roomName && 
+			normalizeDeviceName(lightSceneLocations[light.id.toString()].roomName).equalsIgnoreCase(normalizeDeviceName(sInfo.control.roomName))
 		}?.collect { it.id.toString() } ?: []
 
-		state.switchZoneLights[switchId] = sInfo.loc?.zoneName ? 
+		state.switchZoneLights[switchId] = sInfo.control?.zoneName ? 
 			settings.controlledLightsAndScenes?.findAll { light ->
 				!isScene(light) && light?.id && lightSceneLocations[light.id.toString()]?.zoneName &&
-				normalizeDeviceName(lightSceneLocations[light.id.toString()].zoneName).equalsIgnoreCase(normalizeDeviceName(sInfo.loc.zoneName))
+				normalizeDeviceName(lightSceneLocations[light.id.toString()].zoneName).equalsIgnoreCase(normalizeDeviceName(sInfo.control.zoneName))
 			}?.collect { it.id.toString() }?.unique() ?: [] : []
+	}
+
+	// Step 2b: Lights in the room a switch physically sits in, for switches with an
+	// "(in X)" suffix. Used only for LED brightness; control mappings never read it.
+	state.switchInfoMap.each { switchId, sInfo ->
+		if (!sInfo.ledRoom) return
+		state.switchLedRoomLights[switchId] = settings.controlledLightsAndScenes?.findAll { light ->
+			!isScene(light) && light?.id && lightSceneLocations[light.id.toString()]?.roomName &&
+			normalizeDeviceName(lightSceneLocations[light.id.toString()].roomName).equalsIgnoreCase(normalizeDeviceName(sInfo.ledRoom))
+		}?.collect { it.id.toString() } ?: []
 	}
 
 	// Step 3: Assign Area Lights to Regular and All switches
@@ -676,10 +723,10 @@ def buildDeviceMaps() {
 
 	// Step 6: Assign Zone Scenes if no primary scenes (non-local switches)
 	state.switchInfoMap.each { switchId, sInfo ->
-		if (sInfo.type == "local" || !(sInfo.loc?.zoneName && (state.sortedSwitchSceneIds[switchId]?.isEmpty() ?: true)) ) return
+		if (sInfo.type == "local" || !(sInfo.control?.zoneName && (state.sortedSwitchSceneIds[switchId]?.isEmpty() ?: true)) ) return
 
-		log.info "Switch '${sInfo.displayName}' zone '${sInfo.loc.zoneName}', no primary scenes. Checking zone scenes."
-		String zoneNamePrefix = sInfo.loc.zoneName
+		log.info "Switch '${sInfo.displayName}' zone '${sInfo.control.zoneName}', no primary scenes. Checking zone scenes."
+		String zoneNamePrefix = sInfo.control.zoneName
 		List<String> zoneSceneIds = settings.controlledLightsAndScenes?.findAll { targetDev ->
 			isScene(targetDev) && targetDev?.id &&
 			normalizeDeviceName(lightSceneLocations[targetDev.id.toString()]?.parsingName)?.toLowerCase()?.startsWith(normalizeDeviceName(zoneNamePrefix).toLowerCase())
@@ -718,6 +765,20 @@ def buildDeviceMaps() {
 		}
 	}
 	log.info "LED bar sync: mapped ${state.switchSyncSourceIds.size()} switch(es) to ${state.lightToSyncSwitchIds.size()} light(s)."
+
+	// Step 8: Build the LED brightness dependency map. At night, a sensor-less room's LED
+	// brightness scales with its light level, so a change to any room light must refresh
+	// every switch in that room, local switches included.
+	state.lightToBrightnessSwitchIds = [:]
+	state.switchInfoMap.each { switchId, sInfo ->
+		getBrightnessSourceIds(switchId).each { lightId ->
+			def light = getDevicesById(lightId.toString(), settings.controlledLightsAndScenes)
+			if (!light || isAllLightsGroup(light)) return
+			List swIds = state.lightToBrightnessSwitchIds[lightId] ?: []
+			swIds << switchId
+			state.lightToBrightnessSwitchIds[lightId] = swIds
+		}
+	}
 	log.info "buildDeviceMaps finished."
 }
 
@@ -762,6 +823,10 @@ def modeChangeHandler(evt) {
 	state.motionBypass = [:]
 	log.info "All temporary motion bypasses cleared due to mode change."
 
+	// Resend every switch's LED brightness on mode changes, unchanged values included:
+	// the LED queue skips values it already sent, so a dropped parameter write would
+	// otherwise never be retried while a room's target stays the same.
+	state.lastAppliedLedParams = [:]
 	scheduleLedUpdates(newModeName)
 
 	if (previousModeName == null) {
@@ -932,12 +997,17 @@ private void updateLEDs(switchDevice, Integer onBrightness, Integer offBrightnes
 	}
 }
 
-private String getSwitchRoomName(String switchId) {
+/**
+ * The room a switch's LEDs are seen in, for LED brightness: its "(in X)" name suffix
+ * when present, otherwise the room it controls.
+ */
+private String getSwitchLedRoom(String switchId) {
 	if (!switchId) return null
 	def sInfo = state.switchInfoMap ? state.switchInfoMap[switchId] : null
-	if (sInfo?.loc?.roomName) return sInfo.loc.roomName
-	def loc = state.switchIdToLocationMap ? state.switchIdToLocationMap[switchId] : null
-	return loc?.roomName
+	if (sInfo?.ledRoom) return sInfo.ledRoom
+	if (sInfo?.control?.roomName) return sInfo.control.roomName
+	def control = state.switchIdToControlMap ? state.switchIdToControlMap[switchId] : null
+	return control?.roomName
 }
 
 /**
@@ -955,7 +1025,7 @@ private Map calcLEDLevel(switchDevice, String currentModeName) {
 	}
 	if (settings.enableDynamicLedBrightness == false) return null
 
-	String swRoom = getSwitchRoomName(swId)
+	String swRoom = getSwitchLedRoom(swId)
 	if (swRoom && state.roomToSensorSwitchMap && state.roomToSensorSwitchMap[swRoom]) {
 		def roomStatus = state.roomLedStatus ? state.roomLedStatus[swRoom] : null
 		if (roomStatus?.currentOn != null && roomStatus?.currentOff != null) {
@@ -968,19 +1038,12 @@ private Map calcLEDLevel(switchDevice, String currentModeName) {
 /**
  * Sun-based LED brightness for rooms without a lux sensor:
  *   - Daylight (sunrise+30m to sunset-30m): Bright Room levels.
- *   - Night with any room light on (room is lit): Bright Room levels.
- *   - Night with all room lights off (room is dark): Dark Room levels.
+ *   - Night: scales with the room's light level, from Dark Room levels with every
+ *     light off up to Bright Room levels with the brightest light at 100%.
  */
 private Map computeSensorlessLedLevels(String switchId) {
-	Integer minOn = (settings.dynamicLedMinOn != null) ? (settings.dynamicLedMinOn as Integer) : 2
-	Integer maxOn = (settings.dynamicLedMaxOn != null) ? (settings.dynamicLedMaxOn as Integer) : 30
-	Integer minOff = (settings.dynamicLedMinOff != null) ? (settings.dynamicLedMinOff as Integer) : 1
-	Integer maxOff = (settings.dynamicLedMaxOff != null) ? (settings.dynamicLedMaxOff as Integer) : 7
-
-	if (isDaylightWindow() || isAnyRoomLightOn(switchId)) {
-		return [on: maxOn, off: maxOff]
-	}
-	return [on: minOn, off: minOff]
+	if (isDaylightWindow()) return interpolateLedLevels(1.0d)
+	return interpolateLedLevels(getRoomLightLevel(switchId) / 100.0d)
 }
 
 /** True between sunrise+30m and sunset-30m. Fails open (daylight) if sun times are unavailable. */
@@ -996,13 +1059,30 @@ private boolean isDaylightWindow() {
 	}
 }
 
-/** True if any light in the switch's room (falling back to its mirrored lights) is on. */
-private boolean isAnyRoomLightOn(String switchId) {
-	List lightIds = (state.switchRoomLights ? state.switchRoomLights[switchId] : null) ?:
-					(state.switchSyncSourceIds ? state.switchSyncSourceIds[switchId] : null) ?: []
-	if (!lightIds) return false
+/**
+ * Lights whose state drives a switch's LED brightness: the lights of the room named by
+ * its "(in X)" suffix, otherwise its own room's lights, falling back to its mirrored lights.
+ */
+private List getBrightnessSourceIds(String switchId) {
+	// An "(in X)" room with no lights is still authoritative: that room is dark.
+	if (state.switchLedRoomLights?.containsKey(switchId)) return (state.switchLedRoomLights[switchId] ?: []) as List
+	return ((state.switchRoomLights ? state.switchRoomLights[switchId] : null) ?:
+			(state.switchSyncSourceIds ? state.switchSyncSourceIds[switchId] : null) ?: []) as List
+}
+
+/**
+ * The room's light level (0-100) for sensor-less LED scaling: the level of the brightest
+ * lit light, or 0 if all are off. A lit light that reports no level counts as 100.
+ */
+private Integer getRoomLightLevel(String switchId) {
+	List lightIds = getBrightnessSourceIds(switchId)
+	if (!lightIds) return 0
 	def lights = getDevicesById(lightIds, settings.controlledLightsAndScenes)
-	return lights?.any { !isAllLightsGroup(it) && it.currentValue("switch", true) == "on" } ?: false
+	List levels = lights.findAll { !isAllLightsGroup(it) && it.currentValue("switch", true) == "on" }.collect { light ->
+		def rawLevel = light.hasAttribute("level") ? light.currentValue("level", true) : null
+		(rawLevel != null) ? (Math.round((rawLevel as Double).doubleValue()) as Integer) : 100
+	}
+	return levels ? Math.max(0, Math.min(100, levels.max() as Integer)) : 0
 }
 
 /** Recomputes one switch's LED brightness and queues an update only if it changed. */
@@ -1020,11 +1100,15 @@ private void refreshLedBrightness(String switchId) {
 
 /**
  * Periodic LED brightness sweep over all switches (including local switches, which the
- * bar sync engine skips). Catches sunrise/sunset boundary crossings and external drift;
- * queues updates only where the target differs from the last applied values.
+ * bar sync engine skips). Catches sunrise/sunset boundary crossings, lux readings the
+ * cooldown dropped, and external drift; queues updates only where the target differs
+ * from the last applied values.
  */
 def refreshAllLedBrightness() {
 	if (settings.enableDynamicLedBrightness == false) return
+	// Re-apply each sensor room's latest stored lux. Readings still pass the normal
+	// change thresholds, so a stable room sends nothing.
+	state.roomToSensorSwitchMap?.keySet()?.collect()?.each { roomName -> reevaluateRoomFromSensor(roomName.toString()) }
 	String modeName = state.currentLocationMode ?: location.currentMode?.name?.toString()?.trim()
 	List<Map> items = []
 	settings.controlledSwitches?.each { sw ->
@@ -1047,32 +1131,36 @@ private boolean isZoneBypassed(String switchId, String modeName) {
 	if (!modeName) return false
 	String safeModeName = modeName.replaceAll("[^a-zA-Z0-9_]", "_").toLowerCase()
 	String disabledZone = settings."ledOffZone_${safeModeName}"
-	if (disabledZone && !disabledZone.trim().isEmpty() && state.switchIdToLocationMap) {
-		String switchZone = state.switchIdToLocationMap[switchId]?.zoneName?.trim()
+	if (disabledZone && !disabledZone.trim().isEmpty() && state.switchIdToControlMap) {
+		String switchZone = state.switchIdToControlMap[switchId]?.zoneName?.trim()
 		return switchZone && switchZone.equalsIgnoreCase(disabledZone.trim())
 	}
 	return false
 }
 
 /**
- * Calculates target LED On and Off brightness from ambient lux using linear interpolation:
- * Lux 0 -> [minOn, minOff] (default 2%, 1%)
- * Lux >= maxLux -> [maxOn, maxOff] (default 30%, 7%)
+ * Calculates target LED On and Off brightness from ambient lux:
+ * Lux 0 -> Dark Room levels, Lux >= Bright Room Lux Threshold -> Bright Room levels.
  */
 private Map calculateTargetLedLevels(Double lux) {
+	Double maxLuxThreshold = (settings.dynamicLedMaxLux != null) ? (settings.dynamicLedMaxLux as Double) : 100.0
+	if (maxLuxThreshold <= 0.0) maxLuxThreshold = 100.0
+	return interpolateLedLevels((lux ?: 0.0d) / maxLuxThreshold)
+}
+
+/**
+ * Linearly interpolates LED On and Off brightness between the Dark Room settings
+ * (ratio 0) and the Bright Room settings (ratio 1). The ratio is clamped to 0..1.
+ */
+private Map interpolateLedLevels(Double ratio) {
 	Integer minOn = (settings.dynamicLedMinOn != null) ? (settings.dynamicLedMinOn as Integer) : 2
 	Integer maxOn = (settings.dynamicLedMaxOn != null) ? (settings.dynamicLedMaxOn as Integer) : 30
 	Integer minOff = (settings.dynamicLedMinOff != null) ? (settings.dynamicLedMinOff as Integer) : 1
 	Integer maxOff = (settings.dynamicLedMaxOff != null) ? (settings.dynamicLedMaxOff as Integer) : 7
-	Double maxLuxThreshold = (settings.dynamicLedMaxLux != null) ? (settings.dynamicLedMaxLux as Double) : 100.0
-	if (maxLuxThreshold <= 0.0) maxLuxThreshold = 100.0
 
-	Double clampedLux = Math.max(0.0, Math.min(lux ?: 0.0, maxLuxThreshold))
-	Double ratio = clampedLux / maxLuxThreshold
-
-	Integer targetOn = Math.round(minOn + (maxOn - minOn) * ratio) as Integer
-	Integer targetOff = Math.round(minOff + (maxOff - minOff) * ratio) as Integer
-
+	Double r = Math.max(0.0d, Math.min((ratio ?: 0.0d) as Double, 1.0d))
+	Integer targetOn = Math.round(minOn + (maxOn - minOn) * r) as Integer
+	Integer targetOff = Math.round(minOff + (maxOff - minOff) * r) as Integer
 	return [on: targetOn, off: targetOff]
 }
 
@@ -1115,7 +1203,7 @@ private void setupRoomLightSensors() {
 	settings.controlledSwitches.each { sw ->
 		if (!sw) return
 		String swId = sw.id.toString()
-		String roomName = getSwitchRoomName(swId)
+		String roomName = getSwitchLedRoom(swId)
 		if (!roomName) return
 
 		boolean hasIlluminance = sw.hasCapability("IlluminanceMeasurement") || sw.hasCapability("Illuminance Measurement")
@@ -1173,11 +1261,7 @@ private void setupRoomLightSensors() {
 	}
 }
 
-/**
- * Handles illuminance events from a room's designated sensor switch.
- * Enforces a cooldown (default 1 minute), minimum lux change thresholds, and an
- * integer deadband before queueing parameter updates for all switches in the room.
- */
+/** Handles illuminance events from a room's designated sensor switch. */
 def illuminanceHandler(evt) {
 	if (settings.enableDynamicLedBrightness == false) return
 
@@ -1186,7 +1270,7 @@ def illuminanceHandler(evt) {
 	String sensorId = sensorSwitch.id.toString()
 	String roomName = state.sensorSwitchToRoomMap ? state.sensorSwitchToRoomMap[sensorId] : null
 	if (!roomName) {
-		roomName = getSwitchRoomName(sensorId)
+		roomName = getSwitchLedRoom(sensorId)
 	}
 	if (!roomName) {
 		log.debug "Dynamic LEDs: Illuminance event from ${sensorSwitch.displayName}, but no associated room found. Ignoring."
@@ -1202,16 +1286,66 @@ def illuminanceHandler(evt) {
 		return
 	}
 
+	evaluateRoomLux(roomName, currentLux)
+}
+
+/**
+ * Re-applies the room sensor's latest lux reading. This reads the value the hub already
+ * stored from the sensor's last report; it does not poll the device.
+ */
+private void reevaluateRoomFromSensor(String roomName) {
+	if (settings.enableDynamicLedBrightness == false) return
+	String sensorId = state.roomToSensorSwitchMap ? state.roomToSensorSwitchMap[roomName] : null
+	def sensor = sensorId ? getDevicesById(sensorId, settings.controlledSwitches) : null
+	def rawLux = sensor?.currentValue("illuminance", true)
+	if (rawLux == null) return
+	try {
+		evaluateRoomLux(roomName, rawLux as Double)
+	} catch (e) {
+		log.warn "Dynamic LEDs: Could not re-evaluate lux for room '${roomName}': ${e.message}"
+	}
+}
+
+/**
+ * Schedules one lux re-evaluation for a room after its cooldown ends. At most one retry
+ * is pending per room; a pending time long past means its timer was lost (e.g. a hub
+ * reboot), so a new one is scheduled.
+ */
+private void scheduleLuxRetry(String roomName, long delayMs) {
+	long nowMs = now()
+	state.pendingLuxRetry = state.pendingLuxRetry ?: [:]
+	Long pendingAt = state.pendingLuxRetry[roomName] as Long
+	if (pendingAt != null && pendingAt > nowMs - 10000L) return
+	long retryDelayMs = delayMs + 1000L
+	state.pendingLuxRetry[roomName] = nowMs + retryDelayMs
+	runInMillis(retryDelayMs, "retryRoomLux", [data: [room: roomName], overwrite: false])
+}
+
+def retryRoomLux(data) {
+	String roomName = data?.room?.toString()
+	if (!roomName) return
+	state.pendingLuxRetry?.remove(roomName)
+	reevaluateRoomFromSensor(roomName)
+}
+
+/**
+ * Applies a lux reading to a room's LED brightness. Enforces a cooldown (default
+ * 1 minute), minimum lux change thresholds, and an integer deadband before queueing
+ * parameter updates for all switches in the room.
+ */
+private void evaluateRoomLux(String roomName, Double currentLux) {
 	long nowMs = now()
 	Map roomStatus = (state.roomLedStatus && state.roomLedStatus[roomName]) ? (state.roomLedStatus[roomName] as Map) : [:]
 	long lastUpdatedTime = roomStatus.lastUpdated ?: 0L
 	Integer cooldownMinutes = (settings.dynamicLedCooldownMinutes != null) ? (settings.dynamicLedCooldownMinutes as Integer) : 1
 	long cooldownMs = cooldownMinutes * 60 * 1000L
 
-	// 1. Cooldown check (default 1 minute)
+	// 1. Cooldown check (default 1 minute). Sensors report only on change, so a reading
+	// dropped here may never be re-sent; retry once the cooldown ends.
 	if ((nowMs - lastUpdatedTime) < cooldownMs) {
-		long secondsRemaining = ((cooldownMs - (nowMs - lastUpdatedTime)) / 1000).toLong()
-		log.debug "Dynamic LEDs: Cooldown active for room '${roomName}' (${secondsRemaining}s remaining). Skipping update for ${currentLux} Lux."
+		long msRemaining = cooldownMs - (nowMs - lastUpdatedTime)
+		log.debug "Dynamic LEDs: Cooldown active for room '${roomName}' (${(msRemaining / 1000).toLong()}s remaining). Deferring ${currentLux} Lux."
+		scheduleLuxRetry(roomName, msRemaining)
 		return
 	}
 
@@ -1258,7 +1392,7 @@ def illuminanceHandler(evt) {
 	settings.controlledSwitches?.each { sw ->
 		if (!sw) return
 		String swId = sw.id.toString()
-		String swRoom = getSwitchRoomName(swId)
+		String swRoom = getSwitchLedRoom(swId)
 		if (swRoom && swRoom.equalsIgnoreCase(roomName)) {
 			if (isZoneBypassed(swId, currentMode)) {
 				log.debug "Dynamic LEDs: Switch '${sw.displayName}' in room '${roomName}' is zone-bypassed in mode '${currentMode}'. Keeping LEDs at 0."
@@ -1307,22 +1441,59 @@ private void clearMotionBypass(String switchId) {
  */
 
 def lightStateSyncHandler(evt) {
-	List switchIds = state.lightToSyncSwitchIds ? state.lightToSyncSwitchIds[evt.device.id.toString()] : null
-	if (switchIds) requestLedBarSync(switchIds)
+	requestSyncForLights([evt.device.id.toString()], 750L)
 }
 
-private void subscribeToSyncSourceLights() {
-	if (!state.lightToSyncSwitchIds) return
-	state.lightToSyncSwitchIds.keySet().each { lightId ->
+private void subscribeToLightChanges() {
+	Set lightIds = [] as Set
+	lightIds.addAll(state.lightToSyncSwitchIds?.keySet() ?: [])
+	lightIds.addAll(state.lightToBrightnessSwitchIds?.keySet() ?: [])
+	lightIds.each { lightId ->
 		def light = getDevicesById(lightId.toString(), settings.controlledLightsAndScenes)
 		if (!light) {
-			log.warn "LED bar sync: could not find light ID ${lightId} to subscribe."
+			log.warn "Light sync: could not find light ID ${lightId} to subscribe."
 			return
 		}
 		subscribe(light, "switch", lightStateSyncHandler)
 		if (light.hasAttribute("level")) subscribe(light, "level", lightStateSyncHandler)
 	}
-	log.info "LED bar sync: subscribed to ${state.lightToSyncSwitchIds.size()} light(s)."
+	log.info "Light sync: subscribed to ${lightIds.size()} light(s)."
+}
+
+/**
+ * Entry point for "these lights changed", from device events and post-action nudges.
+ * Queues an LED bar sync for switches mirroring the lights, and an LED brightness
+ * refresh for every switch in the lights' rooms.
+ */
+private void requestSyncForLights(Collection lightIds, Long delayMs = 2500L) {
+	if (!lightIds) return
+	requestLedBarSync(switchIdsForLights(state.lightToSyncSwitchIds, lightIds), delayMs)
+	requestLedBrightnessRefresh(switchIdsForLights(state.lightToBrightnessSwitchIds, lightIds), delayMs)
+}
+
+private Set switchIdsForLights(Map lightToSwitchIds, Collection lightIds) {
+	Set switchIds = [] as Set
+	if (!lightToSwitchIds) return switchIds
+	lightIds.each { lightId ->
+		List ids = lightToSwitchIds[lightId?.toString()]
+		if (ids) switchIds.addAll(ids)
+	}
+	return switchIds
+}
+
+/** Debounced LED brightness recompute; changed values are applied through the LED queue. */
+private void requestLedBrightnessRefresh(Collection switchIds, Long delayMs = 750L) {
+	if (!switchIds) return
+	Map pending = state.pendingLedBrightnessRefresh ?: [:]
+	switchIds.each { id -> if (id) pending[id.toString()] = true }
+	state.pendingLedBrightnessRefresh = pending
+	runInMillis(delayMs, "processLedBrightnessRefresh")
+}
+
+def processLedBrightnessRefresh() {
+	Map pending = state.pendingLedBrightnessRefresh ?: [:]
+	state.pendingLedBrightnessRefresh = [:]
+	pending.keySet().each { switchId -> refreshLedBrightness(switchId.toString()) }
 }
 
 /**
@@ -1336,17 +1507,6 @@ private void requestLedBarSync(Collection switchIds, Long delayMs = 750L) {
 	switchIds.each { id -> if (id) pending[id.toString()] = true }
 	state.pendingLedBarSync = pending
 	if (pending) runInMillis(delayMs, "processLedBarSyncQueue")
-}
-
-/** Maps changed lights to the switches mirroring them, then queues those switches. */
-private void requestLedBarSyncForLights(Collection lightIds, Long delayMs = 2500L) {
-	if (!lightIds || !state.lightToSyncSwitchIds) return
-	Set switchIds = [] as Set
-	lightIds.each { lightId ->
-		List ids = state.lightToSyncSwitchIds[lightId?.toString()]
-		if (ids) switchIds.addAll(ids)
-	}
-	if (switchIds) requestLedBarSync(switchIds, delayMs)
 }
 
 def processLedBarSyncQueue() {
@@ -1386,9 +1546,6 @@ private void syncLedBar(String switchId) {
 	def sw = getDevicesById(switchId, settings.controlledSwitches)
 	if (!sw) return
 	if (state.switchInfoMap && state.switchInfoMap[switchId]?.type == "local") return
-	// LED brightness shares the bar sync triggers (light events, nudges, reconcile):
-	// recompute it here so sensor-less rooms react when their lights turn on/off.
-	refreshLedBrightness(switchId)
 	Map ref = computeLedBarReference(switchId)
 	if (ref == null) return
 
@@ -1622,7 +1779,7 @@ private boolean cycleScene(triggeringSwitch, String direction = "next") {
 	setMotionBypass(switchId)
 	// Scenes change bulbs outside this app's direct commands; nudge the LED bar sync
 	// for everything this switch could be mirroring once the scene has settled.
-	requestLedBarSyncForLights(((state.switchAreaLights[switchId] ?: []) + (state.switchRoomLights[switchId] ?: []) + (state.switchZoneLights[switchId] ?: [])).unique(), 3000L)
+	requestSyncForLights(((state.switchAreaLights[switchId] ?: []) + (state.switchRoomLights[switchId] ?: []) + (state.switchZoneLights[switchId] ?: [])).unique(), 3000L)
 	return true
 }
 
@@ -1644,9 +1801,9 @@ private void handleNormalModeAction(triggeringSwitch, buttonNumber, buttonEvent)
 	boolean isThisSwitchSceneOnly = isSceneOnlySwitch(switchId)
 
 	List<String> roomOrZoneLightIds = []
-	if (switchInfo?.loc?.roomName) {
+	if (switchInfo?.control?.roomName) {
 		roomOrZoneLightIds = state.switchRoomLights[switchId] ?: []
-	} else if (switchInfo?.loc?.zoneName) {
+	} else if (switchInfo?.control?.zoneName) {
 		roomOrZoneLightIds = state.switchZoneLights[switchId] ?: []
 	}
 	def allRoomOrZoneLights = getDevicesById(roomOrZoneLightIds, settings.controlledLightsAndScenes) ?: []
@@ -1740,22 +1897,22 @@ private void handleAreaOn(triggeringSwitch, areaLights) {
 
 	applyToLights(areaLights, targetLevel, targetCt, shouldSetCt)
 	clearMotionBypass(triggeringSwitch.id.toString())
-	requestLedBarSyncForLights(areaLights.collect { it.id.toString() })
+	requestSyncForLights(areaLights.collect { it.id.toString() })
 }
 
 private void handleZoneOn(triggeringSwitch) {
 	def switchId = triggeringSwitch.id.toString()
 	def sInfo = state.switchInfoMap[switchId]
-	if (!sInfo?.loc) {
+	if (!sInfo?.control) {
 		log.warn "No switch/location info for ${triggeringSwitch.displayName} in handleZoneOn."
 		return
 	}
 
 	Map targetSettings = getModeSettings()
-	List<String> lightsToControlIds = sInfo.loc.zoneName ? (state.switchZoneLights[switchId] ?: []) : 
-									  sInfo.loc.roomName ? (state.switchRoomLights[switchId] ?: []) : []
-	String controlScope = sInfo.loc.zoneName ? "Zone '${sInfo.loc.zoneName}'" : 
-						  sInfo.loc.roomName ? "Room '${sInfo.loc.roomName}'" : "Unknown Scope"
+	List<String> lightsToControlIds = sInfo.control.zoneName ? (state.switchZoneLights[switchId] ?: []) : 
+									  sInfo.control.roomName ? (state.switchRoomLights[switchId] ?: []) : []
+	String controlScope = sInfo.control.zoneName ? "Zone '${sInfo.control.zoneName}'" : 
+						  sInfo.control.roomName ? "Room '${sInfo.control.roomName}'" : "Unknown Scope"
 
 	if (!lightsToControlIds?.any()) {
 		log.info "No lights for ${controlScope} for ${triggeringSwitch.displayName}. Zone/Room On skipped."
@@ -1767,7 +1924,7 @@ private void handleZoneOn(triggeringSwitch) {
 		log.info "Zone/Room On by ${triggeringSwitch.displayName}: ${lightsToControl.size()} lights for ${controlScope} to Lvl:${targetSettings.level}%, CT:${targetSettings.ct}K (SetCT:${targetSettings.enableCt})"
 		applyToLights(lightsToControl, targetSettings.level, targetSettings.ct, targetSettings.enableCt)
 		clearMotionBypass(switchId)
-		requestLedBarSyncForLights(lightsToControlIds)
+		requestSyncForLights(lightsToControlIds)
 	}
 }
 
@@ -1777,7 +1934,7 @@ private void handleAreaOff(triggeringSwitch, areaLights) {
 		log.info "handleAreaOff for ${triggeringSwitch.displayName}: Turning OFF ${areaLights.size()} area light(s)."
 		turnOffLights(areaLights)
 		setMotionBypass(triggeringSwitch.id.toString())
-		requestLedBarSyncForLights(areaLights.collect { it.id.toString() })
+		requestSyncForLights(areaLights.collect { it.id.toString() })
 	} else {
 		log.info "handleAreaOff for ${triggeringSwitch.displayName}: No area lights to turn off."
 	}
@@ -1787,16 +1944,16 @@ private void handleSceneOnlyOff(triggeringSwitch) {
 	def switchId = triggeringSwitch.id.toString()
 	log.info "Scene-only switch ${triggeringSwitch.displayName} tap down: turning off room/zone lights."
 
-	def sInfo = state.switchInfoMap[switchId]; def switchLocation = sInfo?.loc
+	def sInfo = state.switchInfoMap[switchId]; def switchControl = sInfo?.control
 	List<String> lightsToTurnOffIds = []
 	String scope = ""
 
-	if (switchLocation?.roomName) { 
+	if (switchControl?.roomName) { 
 		lightsToTurnOffIds = state.switchRoomLights[switchId] ?: []
-		scope = "room '${switchLocation.roomName}'"
-	} else if (switchLocation?.zoneName) { 
+		scope = "room '${switchControl.roomName}'"
+	} else if (switchControl?.zoneName) { 
 		lightsToTurnOffIds = state.switchZoneLights[switchId] ?: []
-		scope = "zone '${switchLocation.zoneName}'"
+		scope = "zone '${switchControl.zoneName}'"
 	}
 
 	if (lightsToTurnOffIds?.any()) {
@@ -1806,7 +1963,7 @@ private void handleSceneOnlyOff(triggeringSwitch) {
 			log.info "Turning off ${lightsToTurnOff.size()} lights (${lightNames}) in ${scope} for scene-only switch ${triggeringSwitch.displayName}."
 			turnOffLights(lightsToTurnOff)
 			setMotionBypass(switchId)
-			requestLedBarSyncForLights(lightsToTurnOffIds)
+			requestSyncForLights(lightsToTurnOffIds)
 		} else {
 			log.warn "No light devices for ${scope} for scene-only switch ${triggeringSwitch.displayName}."
 		}
@@ -1892,7 +2049,7 @@ private void handleDimStop(triggeringSwitch, dimmableAreaLights) {
 		// Schedule a refresh on the first dimmable light to query its final settled level
 		def firstLightId = dimmableAreaLights.first().id.toString()
 		runInMillis(500, "refreshDimmableLight", [data: [lightId: firstLightId]])
-		requestLedBarSyncForLights(dimmableAreaLights.collect { it.id.toString() })
+		requestSyncForLights(dimmableAreaLights.collect { it.id.toString() })
 	} else {
 		log.info "handleDimStop for ${triggeringSwitch.displayName}: No dimmable lights to stop."
 	}
@@ -1912,15 +2069,15 @@ def refreshDimmableLight(data) {
 private void handleZoneOff(triggeringSwitch) {
 	def switchId = triggeringSwitch.id.toString()
 	def sInfo = state.switchInfoMap[switchId]
-	if (!sInfo?.loc) {
+	if (!sInfo?.control) {
 		log.warn "No switch/location info for ${triggeringSwitch.displayName} in handleZoneOff."
 		return
 	}
 
-	List<String> lightsToControlIds = sInfo.loc.zoneName ? (state.switchZoneLights[switchId] ?: []) :
-									  sInfo.loc.roomName ? (state.switchRoomLights[switchId] ?: []) : []
-	String controlScope = sInfo.loc.zoneName ? "Zone '${sInfo.loc.zoneName}'" :
-						  sInfo.loc.roomName ? "Room '${sInfo.loc.roomName}'" : "Unknown Scope"
+	List<String> lightsToControlIds = sInfo.control.zoneName ? (state.switchZoneLights[switchId] ?: []) :
+									  sInfo.control.roomName ? (state.switchRoomLights[switchId] ?: []) : []
+	String controlScope = sInfo.control.zoneName ? "Zone '${sInfo.control.zoneName}'" :
+						  sInfo.control.roomName ? "Room '${sInfo.control.roomName}'" : "Unknown Scope"
 	
 	if (!lightsToControlIds?.any()) {
 		log.info "No lights for ${controlScope} for ${triggeringSwitch.displayName}. Zone/Room Off skipped."
@@ -1932,7 +2089,7 @@ private void handleZoneOff(triggeringSwitch) {
 		log.info "Zone/Room Off by ${triggeringSwitch.displayName}: Turning off ${lightsToControl.size()} lights for ${controlScope}"
 		turnOffLights(lightsToControl)
 		setMotionBypass(switchId)
-		requestLedBarSyncForLights(lightsToControlIds)
+		requestSyncForLights(lightsToControlIds)
 	}
 }
 
@@ -2444,7 +2601,7 @@ def updateSwitchControlSummary() {
 		state.switchControlSummary = "No switches are currently selected."
 		return
 	}
-	if (!state.switchInfoMap || !state.switchIdToLocationMap || !state.switchAreaLights || 
+	if (!state.switchInfoMap || !state.switchIdToControlMap || !state.switchAreaLights || 
 		!state.switchScenes || !state.sortedSwitchSceneIds || !state.switchZoneLights || !state.switchRoomLights) {
 		state.switchControlSummary = "Device maps not fully initialized. Please save settings again."
 		log.warn "updateSwitchControlSummary: Required state maps missing."
@@ -2467,7 +2624,7 @@ def updateSwitchControlSummary() {
 			}
 			return devName
 		}
-		String roomNameForStripping = sInfo.loc?.roomName?.trim()
+		String roomNameForStripping = sInfo.control?.roomName?.trim()
 		boolean isThisSwitchSceneOnly = isSceneOnlySwitch(switchId)
 
 		// Tap Up (Single)
@@ -2479,13 +2636,13 @@ def updateSwitchControlSummary() {
 		// Tap Down (Single)
 		String tapDownHdr = "Off"
 		List<String> tapDownTargetIds = isThisSwitchSceneOnly ? 
-			((sInfo.loc?.roomName ? state.switchRoomLights[switchId] : []) + (sInfo.loc?.zoneName ? state.switchZoneLights[switchId] : [])).unique() :
+			((sInfo.control?.roomName ? state.switchRoomLights[switchId] : []) + (sInfo.control?.zoneName ? state.switchZoneLights[switchId] : [])).unique() :
 			(state.switchAreaLights[switchId] ?: [])
 		String tapDownNames = getDevicesById(tapDownTargetIds, settings.controlledLightsAndScenes)?.sort { it.displayName ?: '' }?.collect { transformName(it.displayName, roomNameForStripping) }?.join(", ")
 		summary.append("  <b>${tapDownHdr}</b>: ${tapDownNames ?: "None"}\n")
 
 		// Tap Up 2x (Double) - Zone/Room ON
-		List<String> tapUp2xIds = (sInfo.loc?.zoneName ? state.switchZoneLights[switchId] : sInfo.loc?.roomName ? state.switchRoomLights[switchId] : []) ?: []
+		List<String> tapUp2xIds = (sInfo.control?.zoneName ? state.switchZoneLights[switchId] : sInfo.control?.roomName ? state.switchRoomLights[switchId] : []) ?: []
 		String tapUp2xNames = getDevicesById(tapUp2xIds, settings.controlledLightsAndScenes)?.sort { it.displayName ?: '' }?.collect { transformName(it.displayName, roomNameForStripping) }?.join(", ")
 		summary.append("  <b>On 2x</b>: ${tapUp2xNames ?: "None"}\n")
 		
